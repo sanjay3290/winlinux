@@ -75,7 +75,9 @@ jobs:
         if: github.event_name == 'push'
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          for p in package.json packages/*/package.json; do            test "$v" = "$tag" || { echo "$p is $v, tag is $tag"; exit 1; }
+          for p in package.json packages/*/package.json; do
+            v=$(node -p "require('./$p').version")
+            test "$v" = "$tag" || { echo "$p is $v, tag is $tag"; exit 1; }
           done
           echo "all packages are $tag"
 
