@@ -1,0 +1,63 @@
+{
+  "name": "@winlinux/krb-session-key",
+  "version": "1.0.0",
+  "description": "GSSAPI Kerberos initiator (N-API addon) that exposes the context session key, for SMB2 signing with Kerberos.",
+  "keywords": [
+    "kerberos",
+    "gssapi",
+    "session-key",
+    "smb2",
+    "winrm",
+    "napi",
+    "node-addon"
+  ],
+  "homepage": "https://github.com/sanjay3290/winlinux/tree/main/packages/krb-session-key#readme",
+  "bugs": {
+    "url": "https://github.com/sanjay3290/winlinux/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanjay3290/winlinux.git",
+    "directory": "packages/krb-session-key"
+  },
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "binding.gyp",
+    "src/native",
+    "dist/src",
+    "!dist/**/*.map",
+    "prebuilds"
+  ],
+  "gypfile": true,
+  "scripts": {
+    "install": "node-gyp-build",
+    "prebuildify": "prebuildify --napi --strip",
+    "prebuildify:linux": "prebuildify --napi --strip --tag-libc",
+    "build": "tsc",
+    "test": "npm run build && node --test \"dist/test/**/*.test.js\"",
+    "test:kdc": "npm run build && node --test \"dist/test/kdc/*.live.js\""
+  },
+  "dependencies": {
+    "node-gyp-build": "^4.8.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "prebuildify": "^6.0.1",
+    "typescript": "~5.7.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,22 @@
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+  <s:Header>
+    <wsa:Action xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing">http://schemas.dmtf.org/wbem/wsman/1/wsman/fault</wsa:Action>
+    <wsa:MessageID xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing">uuid:FAULT-2</wsa:MessageID>
+  </s:Header>
+  <s:Body>
+    <s:Fault>
+      <s:Code>
+        <s:Value>s:Receiver</s:Value>
+        <s:Subcode>
+          <s:Value>w:TimedOut</s:Value>
+        </s:Subcode>
+      </s:Code>
+      <s:Reason>
+        <s:Text xml:lang="en-US">The WS-Management service cannot complete the operation within the time specified in OperationTimeout.</s:Text>
+      </s:Reason>
+      <s:Detail>
+        <f:WSManFault Code="2150858793" Machine="WIN-HOST" xmlns:f="http://schemas.microsoft.com/wbem/wsman/1/wsmanfault"></f:WSManFault>
+      </s:Detail>
+    </s:Fault>
+  </s:Body>
+</s:Envelope>

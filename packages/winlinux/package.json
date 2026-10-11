@@ -1,0 +1,65 @@
+{
+  "name": "winlinux",
+  "version": "1.0.0",
+  "description": "Connect to Windows servers from Linux and macOS: run commands, read event logs, and move files over WinRM and SMB2.",
+  "keywords": [
+    "windows",
+    "winrm",
+    "smb",
+    "ssh",
+    "powershell",
+    "cli",
+    "remote",
+    "event-log",
+    "ntlm",
+    "kerberos"
+  ],
+  "homepage": "https://github.com/sanjay3290/winlinux#readme",
+  "bugs": {
+    "url": "https://github.com/sanjay3290/winlinux/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanjay3290/winlinux.git",
+    "directory": "packages/winlinux"
+  },
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "winlinux": "bin/winlinux.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "!dist/**/*.map"
+  ],
+  "scripts": {
+    "prepack": "node ../../scripts/npm-readme.mjs README.md",
+    "build": "rm -rf dist && tsc -p tsconfig.json",
+    "build:deps": "npm run build -w @winlinux/auth -w @winlinux/smb2 -w @winlinux/winrm",
+    "build:test": "tsc -p ../smb2/tsconfig.test.json --declaration && rm -rf dist-test && tsc -p tsconfig.test.json",
+    "test": "npm run build:deps && npm run build && npm run build:test && node --test \"dist-test/unit/*.test.js\" \"dist-test/e2e/*.test.js\" \"dist-test/tty/*.test.js\"",
+    "test:live": "npm run build:deps && npm run build && npm run build:test && node --test \"dist-test/live/samba.test.js\"",
+    "test:live:windows": "npm run build:deps && npm run build && npm run build:test && node dist-test/live/windows.js"
+  },
+  "dependencies": {
+    "@winlinux/auth": "1.0.0",
+    "@winlinux/smb2": "1.0.0",
+    "@winlinux/winrm": "1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "~5.7.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

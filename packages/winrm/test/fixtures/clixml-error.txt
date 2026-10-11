@@ -1,0 +1,2 @@
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">Get-Process : Cannot find a process with the name "nope". Verify the process name and call the cmdlet again._x000D__x000A_At line:1 char:1_x000D__x000A_+ Get-Process -Name nope_x000D__x000A_+ ~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_    + CategoryInfo          : ObjectNotFound: (nope:String) [Get-Process], ProcessCommandException_x000D__x000A_    + FullyQualifiedErrorId : NoProcessFoundForGivenName,Microsoft.PowerShell.Commands.GetProcessCommand</S></Objs>

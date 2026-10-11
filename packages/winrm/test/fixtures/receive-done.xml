@@ -1,0 +1,14 @@
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing">
+  <s:Header>
+    <wsa:Action>http://schemas.microsoft.com/wbem/wsman/1/windows/shell/ReceiveResponse</wsa:Action>
+    <wsa:MessageID>uuid:RESP-5</wsa:MessageID>
+  </s:Header>
+  <s:Body>
+    <rsp:ReceiveResponse xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell">
+      <rsp:Stream Name="stdout" CommandId="COMMAND-ID-1">d29ybGQ=</rsp:Stream>
+      <rsp:CommandState CommandId="COMMAND-ID-1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
+        <rsp:ExitCode>3</rsp:ExitCode>
+      </rsp:CommandState>
+    </rsp:ReceiveResponse>
+  </s:Body>
+</s:Envelope>

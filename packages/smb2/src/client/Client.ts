@@ -1,0 +1,525 @@
+import crypto from "crypto";
+import { Socket } from "net";
+import { EventEmitter } from "events";
+import Packet from "../protocol/Packet.js";
+import Request from "../protocol/smb2/Request.js";
+import Response from "../protocol/smb2/Response.js";
+import Header, { headerSize } from "../protocol/smb2/Header.js";
+import Smb2Packet from "../protocol/smb2/Packet.js";
+import StatusCode from "../protocol/smb2/StatusCode.js";
+import HeaderFlag from "../protocol/smb2/HeaderFlag.js";
+import Smb2PacketType from "../protocol/smb2/PacketType.js";
+import Session, { ProviderAuthenticateOptions } from "./Session.js";
+import * as structureUtil from "../protocol/structureUtil.js";
+import { SmbDialectError, SmbEncryptionRequiredError, SmbError, SmbSigningError } from "../errors.js";
+import { signMessage, verifySignature } from "../signing.js";
+import {
+  Cipher,
+  NonceSource,
+  SigningAlgorithm,
+  decryptMessage,
+  encryptMessage,
+  isTransformed,
+  signMessage3,
+  transformSessionId,
+  verifySignature3,
+} from "../smb3.js";
+
+// Per-session SMB 3.x state: the derived keys, the negotiated
+// algorithms, and whether the whole session is encrypted.
+export interface Smb3Session {
+  signingKey: Buffer;
+  signingAlgorithm: SigningAlgorithm;
+  cipher: Cipher;
+  encryptionKey?: Buffer;
+  decryptionKey?: Buffer;
+  encryptData: boolean;
+}
+
+// What went out under each outstanding MessageId. A response is
+// judged against this, never against its own header, whose Signed flag,
+// SessionId, TreeId and Command an on-path attacker can rewrite.
+interface SentRequest {
+  type: Smb2PacketType;
+  sessionId?: string; // unset for NEGOTIATE and the first SESSION_SETUP
+  signed: boolean;
+  encrypted: boolean;
+}
+
+// MS-SMB2 3.3.5.2.9: a request for a session the server no longer has
+// fails with STATUS_USER_SESSION_DELETED, which the server cannot sign. It
+// only ever fails the request.
+const STATUS_USER_SESSION_DELETED = 0xc0000203;
+
+export interface SendOptions {
+  // Rewrites the serialized message before signing (NEGOTIATE contexts).
+  transform?: (message: Buffer) => Buffer;
+}
+
+export interface Options {
+  port?: number;
+  connectTimeout?: number;
+  requestTimeout?: number;
+}
+
+interface Client {
+  on(event: "error", callback: (error: Error) => void): this;
+  on(event: "changeNotify", callback: (response: Response) => void): this;
+
+  once(event: "error", callback: (error: Error) => void): this;
+  once(event: "changeNotify", callback: (response: Response) => void): this;
+}
+
+class Client extends EventEmitter {
+  _id = crypto.randomBytes(4).toString("hex");
+  socket: Socket;
+  nextMessageId: bigint = 0n;
+
+  responseRestChunk: Buffer;
+  responseCallbackMap = new Map<bigint, (response: Response) => void>();
+  private sentRequests = new Map<bigint, SentRequest>();
+
+  connected: boolean = false;
+
+  port: number = 445;
+
+  connectTimeout: number = 5 * 1000;
+  connectTimeoutId: NodeJS.Timeout;
+
+  requestTimeout: number = 5 * 1000;
+  requestTimeoutIdMap = new Map<bigint, NodeJS.Timeout>();
+
+  sessions: Session[] = [];
+
+  // SMB2 packet signing (MS-SMB2 3.2.4.1.1). Keys arrive from the
+  // AuthProvider's sessionKey after SESSION_SETUP completes.
+  sessionKeys = new Map<string, Buffer>();
+  signingEnabled: boolean = false;
+  // messageId -> why its response is refused (bad signature, plaintext on
+  // an encrypted session, undecryptable, malformed) and the error to raise.
+  private failedVerifications = new Map<bigint, { reason: string; ErrorType: typeof SmbError }>();
+
+  // SMB 3.x. `dialect` is set by Session after NEGOTIATE.
+  dialect = 0;
+  // The NEGOTIATE request and response as sent and received, for
+  // FSCTL_VALIDATE_NEGOTIATE_INFO after the first TREE_CONNECT.
+  negotiateExchange?: { sent: Buffer; received: Buffer };
+  negotiateValidated = false;
+  smb3Sessions = new Map<string, Smb3Session>();
+  private encryptedTrees = new Set<string>(); // `${sessionId}:${treeId}`
+  private nonces = new NonceSource();
+
+  constructor(
+    public host: string,
+    public options: Options = {}
+  ) {
+    super();
+
+    if (typeof this.options.port === "number") this.port = this.options.port;
+    if (typeof this.options.connectTimeout === "number") this.connectTimeout = this.options.connectTimeout;
+    if (typeof this.options.requestTimeout === "number") this.requestTimeout = this.options.requestTimeout;
+  }
+
+  async connect() {
+    if (this.connected) return;
+
+    this.socket = new Socket({ allowHalfOpen: true })
+      .addListener("data", this.onData)
+      .addListener("error", this.onError)
+      .addListener("close", this.onClose);
+    this.socket.setTimeout(0);
+    this.socket.setKeepAlive(true);
+
+    const connectPromise = new Promise<void>((resolve, reject) => {
+      this.connectTimeoutId = setTimeout(() => {
+        reject(new Error("connect_timeout"));
+      }, this.connectTimeout);
+      this.socket.connect(
+        this.port,
+        this.host
+      );
+      this.socket.once("connect", () => {
+        resolve();
+      });
+      this.socket.once("error", (err) => {
+        reject(err);
+      });
+    });
+
+    try {
+      await connectPromise;
+      clearTimeout(this.connectTimeoutId);
+      this.connected = true;
+    } catch (err) {
+      this.destroySocket();
+      throw err;
+    }
+  }
+
+  createRequest(header: Header = {}, body: any = {}) {
+    const messageId = this.nextMessageId++;
+
+    return new Request(
+      {
+        messageId,
+        clientId: this._id,
+        ...header
+      },
+      body
+    );
+  }
+
+  async request(header?: Header, body?: any, options?: SendOptions) {
+    const request = this.createRequest(header, body);
+    return await this.send(request, options);
+  }
+
+  setSmb3Session(sessionId: string, state: Smb3Session) {
+    this.smb3Sessions.set(sessionId, state);
+  }
+
+  // A TREE_CONNECT response carried SMB2_SHAREFLAG_ENCRYPT_DATA: every later
+  // request on that tree is encrypted, and plaintext responses are refused.
+  markTreeEncrypted(sessionId: string, treeId: number) {
+    const state = this.smb3Sessions.get(sessionId);
+    if (!state?.encryptionKey || state.cipher === Cipher.None) {
+      throw new SmbEncryptionRequiredError(
+        `the share requires SMB encryption but this connection negotiated none (dialect 0x${this.dialect.toString(16).padStart(4, "0")})`,
+      );
+    }
+    this.encryptedTrees.add(`${sessionId}:${treeId}`);
+  }
+
+  unmarkTree(sessionId: string, treeId: number) {
+    this.encryptedTrees.delete(`${sessionId}:${treeId}`);
+  }
+
+  private encrypts(sessionId: unknown, treeId: unknown): Smb3Session | undefined {
+    if (typeof sessionId !== "string") return undefined;
+    const state = this.smb3Sessions.get(sessionId);
+    if (!state?.encryptionKey) return undefined;
+    if (state.encryptData || this.encryptedTrees.has(`${sessionId}:${treeId}`)) return state;
+    return undefined;
+  }
+
+  setSessionKey(sessionId: string, key: Buffer) {
+    this.sessionKeys.set(sessionId, key);
+  }
+
+  clearSessionKey(sessionId: string) {
+    this.sessionKeys.delete(sessionId);
+    this.smb3Sessions.delete(sessionId);
+    for (const key of [...this.encryptedTrees]) if (key.startsWith(`${sessionId}:`)) this.encryptedTrees.delete(key);
+  }
+
+  enableSigning() {
+    this.signingEnabled = true;
+  }
+
+  private signingFor(request: Request): { key: Buffer; algorithm: SigningAlgorithm } | undefined {
+    if (!this.signingEnabled) return undefined;
+    // NEGOTIATE and SESSION_SETUP predate the session key and always go unsigned.
+    if (request.header.type === Smb2PacketType.Negotiate) return undefined;
+    if (request.header.type === Smb2PacketType.SessionSetup) return undefined;
+    return this.signingKey(request.header.sessionId);
+  }
+
+  private signingKey(sessionId: unknown): { key: Buffer; algorithm: SigningAlgorithm } | undefined {
+    if (typeof sessionId !== "string") return undefined;
+    const smb3 = this.smb3Sessions.get(sessionId);
+    if (smb3) return { key: smb3.signingKey, algorithm: smb3.signingAlgorithm };
+    const key = this.sessionKeys.get(sessionId);
+    return key ? { key, algorithm: SigningAlgorithm.HmacSha256 } : undefined;
+  }
+
+  async send(request: Request, options: SendOptions = {}) {
+    if (!this.connected) throw new Error("not_connected");
+
+    // An encrypted message is not signed: AES-CCM/GCM authenticate it.
+    const encryptFor = request.header.type === Smb2PacketType.Negotiate || request.header.type === Smb2PacketType.SessionSetup
+      ? undefined
+      : this.encrypts(request.header.sessionId, request.header.treeId);
+    const signing = encryptFor ? undefined : this.signingFor(request);
+    if (signing) {
+      request.header.flags = (request.header.flags ?? 0) | HeaderFlag.Signed;
+    }
+    let message = Smb2Packet.serializeMessage(request.header, request.body);
+    if (options.transform) message = options.transform(message);
+    if (signing) {
+      message = signing.algorithm === SigningAlgorithm.HmacSha256
+        ? signMessage(message, signing.key)
+        : signMessage3(message, signing.algorithm, signing.key);
+    }
+    // The bytes as sent, before encryption: the 3.1.1 preauth hash covers them.
+    (request as Request & { raw?: Buffer }).raw = message;
+    const wire = encryptFor
+      ? encryptMessage(message, Buffer.from(request.header.sessionId as string, "hex"), encryptFor.cipher, encryptFor.encryptionKey as Buffer, this.nonces.next(encryptFor.cipher))
+      : message;
+    const messageId = request.header.messageId;
+    this.sentRequests.set(messageId, {
+      type: request.header.type,
+      sessionId: typeof request.header.sessionId === "string" ? request.header.sessionId : undefined,
+      signed: signing !== undefined,
+      encrypted: encryptFor !== undefined,
+    });
+    this.socket.write(Smb2Packet.prefixMessage(wire));
+
+    const sendPromise = new Promise<Response>((resolve, reject) => {
+      const requestTimeoutId = setTimeout(
+        () => {
+          // A late response then has no outstanding request and is discarded.
+          this.sentRequests.delete(messageId);
+          this.responseCallbackMap.delete(messageId);
+          const err = new Error(`request_timeout: ${structureUtil.parseEnumValue(Smb2PacketType, request.header.type)}(${messageId})`);
+          reject(err);
+        },
+        this.requestTimeout
+      );
+
+      this.requestTimeoutIdMap.set(messageId, requestTimeoutId);
+
+      const finishRequest = (response: Response) => {
+        response.request = request;
+
+        const failure = this.failedVerifications.get(messageId);
+        if (failure !== undefined) {
+          this.failedVerifications.delete(messageId);
+          reject(new failure.ErrorType(`${failure.reason}: ${structureUtil.parseEnumValue(Smb2PacketType, request.header.type)}(${messageId})`));
+          return;
+        }
+
+        if (
+          response.header.status !== StatusCode.Success &&
+          response.header.status !== StatusCode.Pending &&
+          response.header.status !== StatusCode.MoreProcessingRequired &&
+          response.header.status !== StatusCode.FileClosed
+        ) {
+          reject(response);
+        } else {
+          resolve(response);
+        }
+      };
+
+      this.responseCallbackMap.set(messageId, finishRequest);
+    });
+
+    try {
+      return await sendPromise;
+    } finally {
+      // Clear on failure too, or a failed request keeps the process alive.
+      clearTimeout(this.requestTimeoutIdMap.get(messageId));
+      this.requestTimeoutIdMap.delete(messageId);
+    }
+  }
+
+  onData = (buffer: Buffer) => {
+    if (this.responseRestChunk) {
+      buffer = Buffer.concat([this.responseRestChunk, buffer]);
+      this.responseRestChunk = undefined;
+    }
+
+    // Nothing may throw out of this socket handler: that would be an
+    // uncaught exception and end the process. A frame that does not
+    // parse cannot be tied to its request, so it fails every pending
+    // request and drops the connection.
+    let chunks: Buffer[];
+    try {
+      const split = Packet.getChunks(buffer);
+      chunks = split.chunks;
+      this.responseRestChunk = split.restChunk;
+    } catch (error) {
+      this.failMalformed(error);
+      return;
+    }
+
+    for (const chunk of chunks) {
+      let message = chunk;
+      let transformSession: string | undefined;
+      if (isTransformed(chunk)) {
+        const sessionId = transformSessionId(chunk).toString("hex");
+        const state = this.smb3Sessions.get(sessionId);
+        try {
+          if (!state?.decryptionKey) throw new Error("no decryption key for this session");
+          message = decryptMessage(chunk, state.cipher, state.decryptionKey).message;
+          transformSession = sessionId;
+        } catch {
+          // The message cannot be tied to a request it may not be from;
+          // fail every pending request and drop the connection.
+          this.failAll("an encrypted SMB response did not decrypt");
+          return;
+        }
+      }
+      let response: Response;
+      try {
+        if (message.length < headerSize) throw new SmbError(`${message.length}-byte message is shorter than the SMB2 header`);
+        const { header } = Smb2Packet.parseHeader(message);
+        const sent = this.sentRequests.get(header.messageId);
+        // No outstanding request has this MessageId: discard it (MS-SMB2
+        // 3.2.5.1.2). Kept, it would answer a later request, after keys
+        // exist, without being checked against that request.
+        if (!sent) continue;
+        const refusal = this.verifyResponse(message, header, sent, transformSession);
+        if (refusal !== undefined) {
+          this.refuse(header.messageId, refusal);
+          continue;
+        }
+        response = Response.parse(message);
+      } catch (error) {
+        this.failMalformed(error);
+        return;
+      }
+      (response as Response & { raw?: Buffer }).raw = message;
+      this.onResponse(response);
+    }
+  }
+
+  // Why a response cannot answer the request sent under its MessageId, or
+  // undefined when it can (MS-SMB2 3.2.5.1). Only the decryption key and
+  // the signature authenticate a response; every header field is checked
+  // against the request, not trusted.
+  private verifyResponse(message: Buffer, header: Header, sent: SentRequest, transformSession: string | undefined): string | undefined {
+    if (header.type !== sent.type) return "response command does not match the request";
+    // NEGOTIATE and the first SESSION_SETUP have no session yet; the
+    // SESSION_SETUP response assigns it.
+    if (sent.sessionId !== undefined && header.sessionId !== sent.sessionId) return "response session does not match the request";
+    if (transformSession !== undefined) {
+      // AES-CCM/GCM authenticated it with transformSession's key.
+      return header.sessionId === transformSession ? undefined : "encrypted response session does not match its TRANSFORM header";
+    }
+    if (sent.encrypted) return "plaintext response on an encrypted session or share refused";
+    const flags = header.flags ?? 0;
+    if (flags & HeaderFlag.Signed) {
+      // The final SESSION_SETUP response is signed with a key derived from
+      // it; Session checks it once that key exists.
+      if (sent.type === Smb2PacketType.SessionSetup) return undefined;
+      const signing = this.signingKey(sent.sessionId);
+      if (!signing) return "signed response for a session with no signing key refused";
+      const ok = signing.algorithm === SigningAlgorithm.HmacSha256
+        ? verifySignature(message, signing.key)
+        : verifySignature3(message, signing.algorithm, signing.key);
+      return ok ? undefined : "response signature verification failed";
+    }
+    if (!sent.signed) return undefined;
+    // MS-SMB2 3.2.5.1.3: an interim response is never signed.
+    const interim = header.status === StatusCode.Pending && (flags & HeaderFlag.Async) !== 0;
+    if (interim || (header.status as number) === STATUS_USER_SESSION_DELETED) return undefined;
+    return "unsigned response to a signed request refused";
+  }
+
+  // Rejects the request with SmbSigningError. The response is not parsed
+  // and raises no "changeNotify" event.
+  private refuse(messageId: bigint, reason: string) {
+    this.sentRequests.delete(messageId);
+    const callback = this.responseCallbackMap.get(messageId);
+    if (!callback) return;
+    this.responseCallbackMap.delete(messageId);
+    this.failedVerifications.set(messageId, { reason, ErrorType: SmbSigningError });
+    callback({ header: { messageId, status: StatusCode.Success }, body: {} } as unknown as Response);
+  }
+
+  // Ends the connection after a check above this layer failed, such as a
+  // VALIDATE_NEGOTIATE_INFO mismatch: pending requests fail and
+  // nothing more is sent.
+  terminate(reason: string) {
+    if (this.connected) this.failAll(reason, SmbDialectError);
+  }
+
+  private failMalformed(error: unknown) {
+    this.failAll(`malformed response from server (${error instanceof Error ? error.message : String(error)})`, SmbError);
+  }
+
+  private failAll(reason: string, ErrorType: typeof SmbError = SmbSigningError) {
+    for (const [messageId, callback] of [...this.responseCallbackMap]) {
+      this.responseCallbackMap.delete(messageId);
+      this.failedVerifications.set(messageId, { reason, ErrorType });
+      callback({ header: { messageId, status: StatusCode.Success }, body: {} } as unknown as Response);
+    }
+    this.sentRequests.clear();
+    this.connected = false;
+    this.destroySocket();
+  }
+
+  onResponse(response: Response) {
+    if (
+      response.header.type === Smb2PacketType.ChangeNotify &&
+      response.header.status === StatusCode.Success
+    ) {
+      this.emit("changeNotify", response);
+    }
+
+    const messageId = response.header.messageId;
+    // An async interim STATUS_PENDING (MS-SMB2 3.3.4.2) is not the answer:
+    // the final response follows with the same MessageId. Samba 4.15+ and
+    // Windows send one for a named-pipe READ served out of process, for
+    // example. CHANGE_NOTIFY keeps its old contract: the interim resolves
+    // the request and the final one arrives as a "changeNotify" event.
+    const interim = response.header.status === StatusCode.Pending && ((response.header.flags ?? 0) & HeaderFlag.Async) !== 0;
+    if (interim && response.header.type !== Smb2PacketType.ChangeNotify) {
+      return;
+    }
+    // The final response ends the request. A CHANGE_NOTIFY stays
+    // outstanding after its interim, until the final response arrives.
+    if (!interim) this.sentRequests.delete(messageId);
+    const callback = this.responseCallbackMap.get(messageId);
+    if (callback) {
+      this.responseCallbackMap.delete(messageId);
+      callback(response);
+    }
+  }
+
+  // Socket errors go to "error" listeners, if any. The client prints
+  // nothing: the "close" that follows marks it disconnected, and pending
+  // requests fail through their own timeouts. Emitting "error" with no
+  // listener would throw, so skip it then.
+  onError = (err: Error) => {
+    if (this.listenerCount("error") > 0) this.emit("error", err);
+  }
+
+  onClose = (hadError: boolean) => {
+    this.connected = false;
+  }
+
+  async echo() {
+    return await this.request({
+      type: Smb2PacketType.Echo
+    });
+  }
+
+  async authenticate(options: ProviderAuthenticateOptions) {
+    if (!this.connected) await this.connect();
+
+    const session = new Session(this);
+    this.registerSession(session);
+    await session.authenticateWithProvider(options);
+    return session;
+  }
+
+  private destroySocket() {
+    this.socket
+      .removeListener("data", this.onData)
+      .removeListener("error", this.onError)
+      .removeListener("close", this.onClose);
+    this.socket.end();
+    this.socket.destroy();
+
+    delete this.socket;
+  }
+
+  private registerSession(session: Session) {
+    session
+      .once("authenticate", () => this.sessions.push(session))
+      .once("logoff", () => this.sessions.splice(this.sessions.indexOf(session), 1));
+  }
+
+  async close() {
+    if (!this.connected) return;
+
+    await Promise.all(this.sessions.map(x => x.logoff()));
+
+    this.destroySocket();
+
+    this.connected = false;
+  }
+}
+
+export default Client;

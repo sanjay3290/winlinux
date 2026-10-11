@@ -1,0 +1,11 @@
+{
+  "source": "MIT krb5 gss_wrap_iov (HEADER|ALLOCATE, DATA, PADDING|ALLOCATE), test/kdc/iov.live.ts",
+  "enctype": "aes128-cts-hmac-sha1-96",
+  "sessionKeyLength": 16,
+  "plaintextLength": 114,
+  "header": "050406ff0000001c0000000034ce60859146046137ecf6a6d18fea73a4874e0dbd32a9d2c47d00b0a6cd661149101a4a237c012cf1a7369bdece1a32",
+  "dataLength": 114,
+  "acceptorHeader": "050407ff0000001c000000000d4dc94200bde970e49c88e9ad5d674eef90c3a861b437266c1bab7ce753da79e5884b03eb13dbf6fa293877f87d1fed",
+  "acceptorPlaintextLength": 32,
+  "acceptorDataLength": 32
+}

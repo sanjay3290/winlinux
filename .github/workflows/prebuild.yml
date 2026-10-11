@@ -1,0 +1,243 @@
+name: Prebuild
+
+# Builds the @winlinux/krb-session-key Node-API binaries for darwin-arm64,
+# darwin-x64, linux-x64 (glibc) and linux-arm64 (glibc), packs the package
+# with all four, and proves that a compiler-free install loads the addon on
+# each platform. This workflow uploads workflow artifacts only: it publishes
+# nothing to npm and creates no GitHub release. Releases build their own
+# prebuilds with scripts/prebuild-local.sh (docs/RELEASING.md).
+#
+# Linux builds run in a node:22-bullseye container (glibc 2.31) so the binary
+# loads on every current glibc distro. linux-arm64 is cross-built: the same container runs
+# under QEMU user emulation (docker/setup-qemu-action) on an x64 runner. The
+# proof for Linux runs in node:22-bookworm-slim, which has no compiler and no
+# Kerberos headers; only the runtime library libgssapi-krb5-2 is installed.
+
+# Only changes that can affect the binaries or this pipeline run it: the
+# addon, this workflow, the prove script and the lockfile. ci.yml builds
+# the addon from source on ubuntu and macOS for every change, so a pull
+# request that touches nothing here loses no coverage.
+on:
+  pull_request:
+    paths:
+      - 'packages/krb-session-key/**'
+      - '.github/workflows/prebuild.yml'
+      - '.github/scripts/prove-prebuild.sh'
+      - 'package-lock.json'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/krb-session-key/**'
+      - '.github/workflows/prebuild.yml'
+      - '.github/scripts/prove-prebuild.sh'
+      - 'package-lock.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prebuild-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PACKAGE: '@winlinux/krb-session-key'
+  PACKAGE_DIR: packages/krb-session-key
+  # Highest glibc symbol version a Linux prebuild may require (Debian 11).
+  GLIBC_FLOOR: '2.31'
+
+jobs:
+  build-darwin:
+    name: build darwin-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - name: Check the runner architecture
+        run: |
+          test "$(node -p process.arch)" = "${{ matrix.arch }}"
+      - run: npm ci --ignore-scripts
+      - name: prebuildify
+        run: npm run prebuildify -w "$PACKAGE"
+      - name: Show the prebuild
+        run: |
+          ls -l "$PACKAGE_DIR/prebuilds/darwin-${{ matrix.arch }}/"
+          file "$PACKAGE_DIR"/prebuilds/darwin-${{ matrix.arch }}/*.node
+      - uses: actions/upload-artifact@v5
+        with:
+          name: prebuild-darwin-${{ matrix.arch }}
+          path: ${{ env.PACKAGE_DIR }}/prebuilds/
+          if-no-files-found: error
+
+  build-linux:
+    name: build linux-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      # node_modules holds only JavaScript (the addon is not compiled here),
+      # so the host install is reused inside the container.
+      - run: npm ci --ignore-scripts
+      - name: Set up QEMU (cross build)
+        if: matrix.arch != 'x64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.platform }}
+      - name: prebuildify in node:22-bullseye (glibc 2.31)
+        run: |
+          docker run --rm --platform "${{ matrix.platform }}" \
+            -v "$PWD:/src" -w /src \
+            -e PACKAGE -e PACKAGE_DIR -e GLIBC_FLOOR -e ARCH="${{ matrix.arch }}" \
+            node:22-bullseye bash -euxo pipefail -c '
+              uname -m
+              test "$(node -p process.arch)" = "$ARCH"
+              ldd --version | sed -n 1p
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends build-essential python3 libkrb5-dev file
+              npm run prebuildify:linux -w "$PACKAGE"
+              ls -l "$PACKAGE_DIR/prebuilds/linux-$ARCH/"
+              file "$PACKAGE_DIR"/prebuilds/linux-$ARCH/*.node
+              # The binary must not link krb5 (dlopen at run time) and must
+              # not need a glibc newer than the floor.
+              ! objdump -p "$PACKAGE_DIR"/prebuilds/linux-$ARCH/*.node | grep -E "NEEDED.*(gssapi|krb5)"
+              need=$(objdump -T "$PACKAGE_DIR"/prebuilds/linux-$ARCH/*.node | grep -oE "GLIBC_[0-9.]+" | sed "s/GLIBC_//" | sort -Vu | tail -1)
+              echo "highest glibc symbol version required: $need (floor $GLIBC_FLOOR)"
+              test "$(printf "%s\n%s\n" "$need" "$GLIBC_FLOOR" | sort -V | tail -1)" = "$GLIBC_FLOOR"
+            '
+      - uses: actions/upload-artifact@v5
+        with:
+          name: prebuild-linux-${{ matrix.arch }}
+          path: ${{ env.PACKAGE_DIR }}/prebuilds/
+          if-no-files-found: error
+
+  pack:
+    name: npm pack with all prebuilds
+    needs: [build-darwin, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build -w "$PACKAGE"
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: prebuild-*
+          merge-multiple: true
+          path: ${{ env.PACKAGE_DIR }}/prebuilds/
+      - name: Check that all four prebuilds are present
+        run: |
+          find "$PACKAGE_DIR/prebuilds" -type f | sort
+          for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            ls "$PACKAGE_DIR/prebuilds/$t/"*.node
+          done
+      - name: npm pack
+        run: |
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm pack -w "$PACKAGE" --pack-destination "$RUNNER_TEMP/pack"
+          ls -l "$RUNNER_TEMP/pack"
+          tar tzf "$RUNNER_TEMP"/pack/*.tgz | sort
+          # The tarball ships the prebuilds and the sources, never a build/.
+          for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            tar tzf "$RUNNER_TEMP"/pack/*.tgz | grep -q "^package/prebuilds/$t/.*\.node$"
+          done
+          ! tar tzf "$RUNNER_TEMP"/pack/*.tgz | grep -q "^package/build/"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: krb-session-key-tarball
+          path: ${{ runner.temp }}/pack/*.tgz
+          if-no-files-found: error
+
+  prove-darwin:
+    name: install without a compiler on darwin-${{ matrix.arch }}
+    needs: pack
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v6
+        with:
+          name: krb-session-key-tarball
+          path: ${{ runner.temp }}/pack
+      - name: Install the tarball with the compiler disabled, then load the addon
+        run: bash .github/scripts/prove-prebuild.sh "$RUNNER_TEMP"/pack/*.tgz
+        env:
+          # The runner has Xcode CLT; make any compile attempt fail.
+          CC: /usr/bin/false
+          CXX: /usr/bin/false
+
+  prove-linux:
+    name: install without a compiler on linux-${{ matrix.arch }}
+    needs: pack
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+      - uses: actions/download-artifact@v6
+        with:
+          name: krb-session-key-tarball
+          path: ${{ runner.temp }}/pack
+      - name: Set up QEMU
+        if: matrix.arch != 'x64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.platform }}
+      - name: Install the tarball in node:22-bookworm-slim (no compiler, no krb5 headers), then load the addon
+        run: |
+          docker run --rm --platform "${{ matrix.platform }}" \
+            -v "$RUNNER_TEMP/pack:/pack:ro" -v "$PWD/.github/scripts:/scripts:ro" \
+            -e ARCH="${{ matrix.arch }}" \
+            node:22-bookworm-slim bash -euxo pipefail -c '
+              test "$(node -p process.arch)" = "$ARCH"
+              # Only the GSSAPI runtime library, which load() dlopens.
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends libgssapi-krb5-2
+              ! command -v cc; ! command -v gcc; ! command -v c++; ! command -v make
+              test ! -e /usr/include/gssapi
+              bash /scripts/prove-prebuild.sh /pack/*.tgz
+            '

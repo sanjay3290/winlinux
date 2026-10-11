@@ -1,0 +1,26 @@
+{
+  "name": "winlinux",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Connect to Windows servers from Linux and macOS (WinRM + SMB2).",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "packages/krb-session-key",
+    "packages/auth",
+    "packages/smb2",
+    "packages/winrm",
+    "packages/winlinux"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "check:linux": "bash scripts/check-linux.sh",
+    "prebuild:local": "bash scripts/prebuild-local.sh",
+    "release": "bash scripts/release.sh",
+    "release:dry": "bash scripts/release.sh --dry-run"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

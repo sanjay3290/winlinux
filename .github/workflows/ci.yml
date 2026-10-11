@@ -1,0 +1,65 @@
+name: CI
+
+# Build, unit-test and audit every package on Linux and macOS.
+# Live suites (Samba AD DC, Windows host) are not run here: they need a
+# domain controller. Run them locally, for example:
+#   npm run test:integration -w @winlinux/auth
+# Other packages keep their live scripts in their own package.json.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [22]
+    steps:
+      - uses: actions/checkout@v7
+
+      # The krb-session-key native addon links against MIT Kerberos GSSAPI on
+      # Linux. macOS uses GSS.framework and the preinstalled Xcode CLT.
+      # The step is skipped on branches that do not contain the addon.
+      - name: Install Kerberos headers (Linux, addon only)
+        if: runner.os == 'Linux' && hashFiles('packages/krb-session-key/binding.gyp') != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential python3 libkrb5-dev
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+      # The README quick start runs `npx winlinux`: the bin must be linked by
+      # `npm ci`, before any build exists.
+      - run: npx --no-install winlinux --version
+      - run: npm test
+      - run: npm audit --audit-level=low
+
+      # Kerberos message encryption over HTTP: the gss_wrap_iov split
+      # against a real MIT acceptor, with a throwaway KDC on localhost (no
+      # root, no Docker). Linux only: the acceptor harness links MIT krb5.
+      - name: Install a local KDC (Linux)
+        if: runner.os == 'Linux' && hashFiles('packages/krb-session-key/test/kdc/acceptor.c') != ''
+        # libgssapi3-heimdal: the Heimdal GSSAPI library, so the ccache
+        # set/clear leg also runs against the library macOS uses.
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends krb5-kdc krb5-admin-server krb5-user libgssapi3-heimdal
+      - name: Live Kerberos round trip against a local KDC (Linux)
+        if: runner.os == 'Linux' && hashFiles('packages/krb-session-key/test/kdc/acceptor.c') != ''
+        run: npm run test:kdc -w @winlinux/krb-session-key -w @winlinux/winrm

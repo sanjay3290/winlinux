@@ -1,0 +1,39 @@
+// Shared network-free fixtures.
+export const TYPE2_424_HEX =
+  '4e544c4d53535000020000000c000c003800000033828ae20123456789abcdef' +
+  '00000000000000002400240044000000060070170000000f5300650072007600' +
+  '6500720002000c0044006f006d00610069006e0001000c005300650072007600' +
+  '6500720000000000';
+
+export const TYPE3_424_HEX =
+  '4e544c4d5353500003000000180018006c00000054005400840000000c000c00' +
+  '480000000800080054000000100010005c00000010001000d8000000358288e2' +
+  '0501280a0000000f44006f006d00610069006e00550073006500720043004f00' +
+  '4d005000550054004500520086c35097ac9cec102554764a57cccc19aaaaaaaa' +
+  'aaaaaaaa68cd0ab851e51c96aabc927bebef6a1c010100000000000000000000' +
+  '00000000aaaaaaaaaaaaaaaa0000000002000c0044006f006d00610069006e00' +
+  '01000c005300650072007600650072000000000000000000c5dad2544fc97990' +
+  '94ce1ce90bc9d03e';
+
+export const TYPE2_424 = Buffer.from(TYPE2_424_HEX, 'hex');
+export const TYPE3_424 = Buffer.from(TYPE3_424_HEX, 'hex');
+
+export const V2 = {
+  user: 'User',
+  password: 'Password',
+  domain: 'Domain',
+  workstation: 'COMPUTER',
+  serverChallenge: '0123456789abcdef',
+  clientChallenge: 'aaaaaaaaaaaaaaaa',
+  time: '0000000000000000',
+  responseKey: '0c868a403bfd7a93a3001ef22ef02e3f',
+  sessionBaseKey: '8de40ccadbc14a82f15cb0ad0de95ca3',
+  exportedSessionKey: '55555555555555555555555555555555',
+  ntProof: '68cd0ab851e51c96aabc927bebef6a1c',
+  lmResponse:
+    '86c35097ac9cec102554764a57cccc19' + 'aaaaaaaaaaaaaaaa',
+  encSessionKey: 'c5dad2544fc9799094ce1ce90bc9d03e',
+  challengeFlags: 0xe28a8233,
+  responseFlags: 0xe2888235,
+  version: { major: 5, minor: 1, build: 2600, reserved: 0, revision: 0x0f },
+};

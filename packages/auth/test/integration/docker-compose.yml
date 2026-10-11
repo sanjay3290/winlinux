@@ -1,0 +1,31 @@
+# Samba AD DC used as a live KDC + SMB server by run-live.sh.
+# Every host-facing value is an env var so parallel runs do not collide.
+# Defaults keep the original values.
+services:
+  ad:
+    # nowsci/samba-ad-dc does not exist on Docker Hub; samba-domain is the
+    # same author's AD DC image. It is amd64 only (emulated on arm64 hosts).
+    image: nowsci/samba-domain:latest
+    platform: linux/amd64
+    container_name: ${WINLINUX_DC_CONTAINER:-winlinux-ad-dc}
+    hostname: dc1
+    domainname: example.com
+    networks:
+      dc:
+        aliases:
+          - dc1.example.com
+    environment:
+      DOMAIN: EXAMPLE.COM
+      DOMAINPASS: Passw0rd!
+      INSECURELDAP: "true"
+    ports:
+      - "${WINLINUX_KDC_PORT:-88}:88/udp"
+      - "${WINLINUX_KDC_PORT:-88}:88/tcp"
+      - "${WINLINUX_LDAP_PORT:-389}:389"
+      - "${WINLINUX_SMB_PORT:-445}:445"
+    cap_add:
+      - SYS_ADMIN
+
+networks:
+  dc:
+    name: ${WINLINUX_DC_NETWORK:-winlinux-ad-net}

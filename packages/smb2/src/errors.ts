@@ -1,0 +1,88 @@
+// Typed errors. SMB status codes come from MS-ERREF; the non-protocol
+// errors (dialect, signing policy, timeouts, size caps) carry no status.
+export class SmbError extends Error {
+  readonly status?: number;
+
+  constructor(message: string, status?: number) {
+    super(status === undefined ? message : `${message} (status 0x${status.toString(16).padStart(8, "0")})`);
+    this.name = this.constructor.name;
+    this.status = status;
+  }
+}
+
+export class SmbAccessDeniedError extends SmbError {}
+export class SmbNotFoundError extends SmbError {}
+export class SmbAlreadyExistsError extends SmbError {}
+export class SmbSharingViolationError extends SmbError {}
+export class SmbAuthError extends SmbError {}
+export class SmbSigningError extends SmbError {}
+export class SmbDialectError extends SmbError {}
+export class SmbTimeoutError extends SmbError {}
+export class SmbConnectionError extends SmbError {}
+export class SmbFileTooLargeError extends SmbError {}
+// Shape errors for the file operations: the path is a file where a
+// directory was needed, a directory where a file was needed, or a directory
+// that still has entries.
+export class SmbNotADirectoryError extends SmbError {}
+export class SmbIsADirectoryError extends SmbError {}
+export class SmbDirectoryNotEmptyError extends SmbError {}
+// A share (or the server) requires SMB 3.x encryption, which this client
+// cannot negotiate yet. Subclass of SmbAccessDeniedError because the
+// wire status is STATUS_ACCESS_DENIED; callers that only know the parent
+// class keep working.
+export class SmbEncryptionRequiredError extends SmbAccessDeniedError {}
+
+export const formatStatus = (status: number) => `0x${status.toString(16).padStart(8, "0")}`;
+
+// Maps an SMB2 error status to a typed error. Never returns.
+export function throwForStatus(status: number, context: string): never {
+  switch (status) {
+    case 0xc0000022: // STATUS_ACCESS_DENIED
+      throw new SmbAccessDeniedError(`access denied: ${context}`, status);
+    case 0xc0000034: // STATUS_OBJECT_NAME_NOT_FOUND
+    case 0xc000003a: // STATUS_OBJECT_PATH_NOT_FOUND
+    case 0xc0000225: // STATUS_NOT_FOUND
+      throw new SmbNotFoundError(`no such file or directory: ${context}`, status);
+    case 0xc00000cc: // STATUS_BAD_NETWORK_NAME
+      throw new SmbNotFoundError(`share not found: ${context}`, status);
+    case 0xc0000103: // STATUS_NOT_A_DIRECTORY
+      throw new SmbNotADirectoryError(`not a directory: ${context}`, status);
+    case 0xc00000ba: // STATUS_FILE_IS_A_DIRECTORY
+      throw new SmbIsADirectoryError(`is a directory: ${context}`, status);
+    case 0xc0000101: // STATUS_DIRECTORY_NOT_EMPTY
+      throw new SmbDirectoryNotEmptyError(`directory not empty: ${context}`, status);
+    case 0xc0000035: // STATUS_OBJECT_NAME_COLLISION
+      throw new SmbAlreadyExistsError(`already exists: ${context}`, status);
+    case 0xc0000043: // STATUS_SHARING_VIOLATION
+      throw new SmbSharingViolationError(`sharing violation (file in use): ${context}`, status);
+    case 0xc000006d: // STATUS_LOGON_FAILURE
+    case 0xc000006e: // STATUS_ACCOUNT_RESTRICTION
+    case 0xc000006f: // STATUS_INVALID_LOGON_HOURS
+    case 0xc0000070: // STATUS_INVALID_WORKSTATION
+    case 0xc0000071: // STATUS_PASSWORD_EXPIRED
+    case 0xc0000072: // STATUS_ACCOUNT_DISABLED
+      throw new SmbAuthError(`authentication failed during ${context}`, status);
+    default:
+      throw new SmbError(`SMB request failed during ${context}`, status);
+  }
+}
+
+// Translates a low-level request failure into a typed error. SMB response
+// rejections (which carry header.status) become SmbError; anything else
+// (timeouts, socket errors, fs errors) passes through untouched, except the
+// client's request_timeout which becomes SmbTimeoutError.
+export function toSmbError(error: unknown, context: string): unknown {
+  if (error instanceof SmbError) return error;
+  const status = (error as { header?: { status?: unknown } })?.header?.status;
+  if (typeof status === "number") {
+    try {
+      throwForStatus(status, context);
+    } catch (typed) {
+      return typed;
+    }
+  }
+  if (error instanceof Error && error.message.startsWith("request_timeout")) {
+    return new SmbTimeoutError(`request timed out during ${context}: ${error.message}`);
+  }
+  return error;
+}
