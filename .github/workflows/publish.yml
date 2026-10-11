@@ -1,0 +1,159 @@
+name: Publish
+
+# Publishes the five packages to npm when a version tag (v1.2.3) is pushed.
+# The tag must equal every package's version. Order follows the dependency
+# graph: @winlinux/krb-session-key, @winlinux/auth, @winlinux/smb2,
+# @winlinux/winrm, winlinux. The addon's prebuilt binaries come from the
+# Prebuild workflow (called here), so the published tarball needs no compiler
+# on darwin/linux x64/arm64.
+#
+# Every tarball is packed and checked before anything is published. A package
+# version that is already on the registry is skipped, so a failed run can be
+# re-run. After publishing, a clean directory installs `winlinux` from the
+# registry and runs the CLI.
+#
+# Authentication: npm trusted publishing (OIDC) when it is configured for the
+# packages on npmjs.com, otherwise the NPM_TOKEN secret. Both publish with
+# provenance. See docs/RELEASING.md.
+#
+# Dry run: a pull request that touches the release workflows, or a manual
+# dispatch with dry_run=true, runs every step with `npm publish --dry-run`.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths: ['.github/workflows/publish.yml', '.github/workflows/prebuild.yml']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Pack and check everything, publish nothing'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # npm provenance and trusted publishing
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Publish only on a tag, and only when dispatch did not ask for a dry run.
+  DRY_RUN: ${{ (github.event_name == 'push' && 'false') || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false && 'false') || 'true' }}
+  PACKAGES: '@winlinux/krb-session-key @winlinux/auth @winlinux/smb2 @winlinux/winrm winlinux'
+
+jobs:
+  prebuild:
+    uses: ./.github/workflows/prebuild.yml
+
+  publish:
+    name: pack, check and publish
+    needs: prebuild
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'push' && 'npm' || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Kerberos headers (the addon builds from source here)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential python3 libkrb5-dev
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: npm 11.5 or later (trusted publishing)
+        run: npm install -g 'npm@^11.5.1' && npm --version
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: npm audit --audit-level=low
+
+      - name: Check that the tag matches every package version
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          for p in package.json packages/*/package.json; do            test "$v" = "$tag" || { echo "$p is $v, tag is $tag"; exit 1; }
+          done
+          echo "all packages are $tag"
+
+      - name: Add the addon prebuilds to the tarball
+        uses: actions/download-artifact@v6
+        with:
+          pattern: prebuild-*
+          merge-multiple: true
+          path: packages/krb-session-key/prebuilds/
+
+      - name: Pack all five packages
+        run: |
+          mkdir -p "$RUNNER_TEMP/pack"
+          for w in $PACKAGES; do
+            npm pack -w "$w" --pack-destination "$RUNNER_TEMP/pack"
+          done
+          ls -l "$RUNNER_TEMP/pack"
+
+      - name: Check every tarball
+        run: |
+          cd "$RUNNER_TEMP/pack"
+          for t in *.tgz; do
+            echo "== $t"
+            tar tzf "$t" | grep -q '^package/LICENSE$' || { echo "no LICENSE in $t"; exit 1; }
+            tar tzf "$t" | grep -q '^package/README.md$' || { echo "no README in $t"; exit 1; }
+            tar tzf "$t" | grep -q '^package/package.json$' || exit 1
+            tar tzf "$t" | grep -q '^package/dist/' || { echo "no dist/ in $t"; exit 1; }
+            # No tests, TypeScript sources or node_modules. The addon's
+            # src/native/ C sources are the one exception: the source-build
+            # fallback compiles them on platforms without a prebuild.
+            ! tar tzf "$t" | grep -E '^package/(test|src|node_modules)/' | grep -qv '^package/src/native/' \
+              || { echo "test or source files in $t"; exit 1; }
+          done
+          # The addon ships its four prebuilds and never a build/ directory.
+          for a in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            tar tzf winlinux-krb-session-key-*.tgz | grep -q "^package/prebuilds/$a/.*\.node$" || { echo "no $a prebuild"; exit 1; }
+          done
+          ! tar tzf winlinux-krb-session-key-*.tgz | grep -q '^package/build/'
+          # The CLI ships its committed bin shim.
+          tar tzf winlinux-[0-9]*.tgz | grep -q '^package/bin/winlinux.js$'
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: npm-tarballs
+          path: ${{ runner.temp }}/pack/*.tgz
+          if-no-files-found: error
+
+      - name: Publish in dependency order (skips versions already published)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          flag=""
+          if [ "$DRY_RUN" = "true" ]; then flag="--dry-run"; echo "dry run: nothing is published"; fi
+          for w in $PACKAGES; do
+            v=$(npm pkg get version -w "$w" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(Object.values(JSON.parse(s))[0]))")
+            if [ -z "$flag" ] && npm view "$w@$v" version >/dev/null 2>&1; then
+              echo "skip $w@$v: already on the registry"
+              continue
+            fi
+            npm publish -w "$w" --access public --provenance $flag
+          done
+
+  verify:
+    name: install from the registry
+    needs: publish
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: npm install winlinux in an empty directory and run the CLI
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir "$RUNNER_TEMP/fresh" && cd "$RUNNER_TEMP/fresh"
+          npm init -y >/dev/null
+          # The registry can lag a few seconds behind publish.
+          for i in 1 2 3 4 5 6; do npm install "winlinux@$version" && break; sleep 10; done
+          test "$(npx --no-install winlinux --version)" = "$version"
+          node --input-type=module -e "import { connect } from 'winlinux'; if (typeof connect !== 'function') process.exit(1); console.log('import ok');"
+          node -e "import('winlinux').then(m => { if (typeof m.connect !== 'function') process.exit(1); console.log('CommonJS dynamic import ok'); })"
