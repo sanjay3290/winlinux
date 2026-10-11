@@ -64,7 +64,46 @@ npm install --package-lock-only
 Add a `## <version>` section to `CHANGELOG.md`, update the expected
 `--version` in `packages/winlinux/test/e2e/cli-winrm.test.ts`, and merge.
 
-## Release 1.0.0
+## Release from GitHub Actions (the normal path)
+
+`.github/workflows/publish.yml` publishes all five packages, with npm
+provenance, when a version tag is pushed. It builds the addon prebuilds on
+GitHub's darwin and Linux runners, builds and tests everything, packs and
+checks every tarball, publishes in dependency order (skipping any version
+already on the registry), then installs `winlinux` from the registry and runs
+the CLI.
+
+One-time setup:
+
+1. **First release only, token:** on npmjs.com create a *granular access
+   token* with **Read and write** on the `@winlinux` scope (organization
+   `winlinux`) and on the `winlinux` package, with a short expiry. Store it as
+   the `NPM_TOKEN` secret of the `npm` environment (or of the repository):
+   `gh secret set NPM_TOKEN --env npm --repo sanjay3290/winlinux`
+   (it prompts for the value; never paste a token into a file or a chat).
+2. **After the first release, trusted publishing:** for each of the five
+   packages, open *Settings > Trusted publishing* on npmjs.com and add a
+   GitHub Actions publisher: repository `sanjay3290/winlinux`, workflow
+   `publish.yml`, environment `npm`. Then delete the `NPM_TOKEN` secret and
+   revoke the token. From then on no secret is stored anywhere.
+
+To release: bump the version (see above), merge to `main`, then
+
+```bash
+git checkout main && git pull
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+Watch the run with `gh run watch --repo sanjay3290/winlinux`. A manual
+dispatch of the Publish workflow with `dry_run` checked runs every step and
+publishes nothing.
+
+## Release from a workstation (fallback)
+
+Use this only when Actions is unavailable. It publishes without provenance.
+
+### Release 1.0.0
 
 From an up-to-date `main` checkout on the Mac:
 
@@ -140,7 +179,7 @@ The registry can lag a minute behind the publish. The package pages are
 `https://www.npmjs.com/package/winlinux` and
 `https://www.npmjs.com/package/@winlinux/auth` (and so on).
 
-## Tag the release (maintainer)
+## Tag a workstation release (maintainer)
 
 After the registry shows all five packages:
 
@@ -150,9 +189,11 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-The tag marks the commit that was published. Pushing it starts no workflow.
-A GitHub release is optional: create it
-from the tag and paste the `## 1.0.0` section of `CHANGELOG.md`.
+Only for a workstation release: the tag marks the commit that was
+published. **Warning:** pushing a `v*` tag starts the Publish workflow; it
+skips versions that are already on the registry, so it publishes nothing
+new. A GitHub release is optional: create it from the tag and paste the
+version's section of `CHANGELOG.md`.
 
 ## Rollback
 
@@ -203,5 +244,10 @@ a copy of the working tree in a fresh `node:22-bookworm` container with
   compiler-free install of each, when a change touches the addon. It
   uploads workflow artifacts only and publishes nothing.
 
-No workflow publishes to npm. `scripts/release.sh` builds the prebuilds
+  It is also called by the Publish workflow.
+- `.github/workflows/publish.yml` publishes to npm on a `v*` tag, with
+  provenance (see "Release from GitHub Actions" above). Pull requests that
+  touch the release workflows run it as a dry run.
+
+`scripts/release.sh` is the workstation fallback: it builds the prebuilds
 again with `scripts/prebuild-local.sh` and publishes the tarballs it tested.
