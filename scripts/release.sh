@@ -3,7 +3,7 @@
 # the five packages from the maintainer's machine.
 #
 #   npm run release:dry                   # everything, with `npm publish --dry-run`
-#   npm run release -- --publish 1.0.0    # the real publish (npm login first)
+#   npm run release -- --publish 1.1.0    # the real publish (npm login first)
 #   bash scripts/release.sh [--dry-run] [<version>] [options]
 #
 # Without --publish nothing is published: the last step runs

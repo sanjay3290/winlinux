@@ -4,7 +4,7 @@
 // untouched — this module never reads passwords.
 import { pipeline } from "node:stream/promises";
 import { createWriteStream, type ReadStream } from "node:fs";
-import { open } from "node:fs/promises";
+import { open, rm } from "node:fs/promises";
 import Client from "./client/Client.js";
 import Session from "./client/Session.js";
 import Tree from "./client/Tree.js";
@@ -25,8 +25,10 @@ import {
   SmbFileTooLargeError,
   SmbIsADirectoryError,
   SmbNotADirectoryError,
+  throwIfAborted,
   toSmbError,
 } from "./errors.js";
+import type DirectoryEntry from "./protocol/models/DirectoryEntry.js";
 import { SHI1005_FLAGS_ENCRYPT_DATA, SrvsvcClient } from "./rpc/srvsvc.js";
 
 export interface SMBConnectOptions {
@@ -75,14 +77,33 @@ export interface FileStat {
   readonly: boolean;
 }
 
+// Cancellation. On abort the call sends no further request, the
+// request in flight rejects at once and its response is discarded, the
+// file or directory handle closes, and the call rejects with SmbAbortError
+// (`err.name === 'AbortError'`, `err.cause` the signal's reason). A signal
+// that is already aborted rejects before any request goes out. The session
+// stays usable for the next call.
+export interface AbortOptions {
+  signal?: AbortSignal;
+}
+
 export interface SMBSession {
   listShares(): Promise<ShareInfo[]>;
-  list(share: string, dirPath?: string): Promise<DirEntry[]>;
-  stat(share: string, filePath: string): Promise<FileStat>;
-  readFile(share: string, filePath: string): Promise<Buffer>;
+  list(share: string, dirPath?: string, opts?: AbortOptions): Promise<DirEntry[]>;
+  // The directory entry by entry, one QUERY_DIRECTORY response at a time:
+  // a caller can stop early with `break`, which closes the handle.
+  listIter(share: string, dirPath?: string, opts?: AbortOptions): AsyncIterable<DirEntry>;
+  stat(share: string, filePath: string, opts?: AbortOptions): Promise<FileStat>;
+  readFile(share: string, filePath: string, opts?: AbortOptions): Promise<Buffer>;
+  // The bytes [offset, offset + length) of a file of any size: the
+  // file opens read-only with share access read, write and delete, so a
+  // file another process holds open for append reads too. Fewer bytes
+  // come back at end of file, an empty Buffer past it. `length` above
+  // MAX_BUFFERED_FILE_BYTES is refused.
+  readRange(share: string, filePath: string, offset: number | bigint, length: number, opts?: AbortOptions): Promise<Buffer>;
   writeFile(share: string, filePath: string, data: Buffer | string): Promise<void>;
   upload(localPath: string, share: string, remotePath: string): Promise<void>;
-  download(share: string, remotePath: string, localPath: string): Promise<void>;
+  download(share: string, remotePath: string, localPath: string, opts?: AbortOptions): Promise<void>;
   readonly security: SmbSecurityInfo; // what the connection negotiated
   delete(share: string, filePath: string): Promise<void>; // file or empty directory
   deleteFile(share: string, filePath: string): Promise<void>; // refuses a directory
@@ -122,6 +143,16 @@ export async function connect(opts: SMBConnectOptions): Promise<SMBSession> {
     }
     throw typed;
   }
+}
+
+function toDirEntry(entry: DirectoryEntry): DirEntry {
+  return {
+    name: entry.filename.replace(/^\.\//, ""),
+    isDirectory: entry.type === "Directory",
+    sizeBytes: entry.fileSize,
+    mtime: entry.lastWriteTime,
+    isReparsePoint: entry.fileAttributes.includes("ReparsePoint"),
+  };
 }
 
 export class SmbSession implements SMBSession {
@@ -184,29 +215,48 @@ export class SmbSession implements SMBSession {
     }
   }
 
-  async list(share: string, dirPath?: string): Promise<DirEntry[]> {
+  async list(share: string, dirPath?: string, opts: AbortOptions = {}): Promise<DirEntry[]> {
+    const context = `list ${share}/${dirPath ?? ""}`;
+    throwIfAborted(opts.signal, context);
     try {
       const tree = await this.treeFor(share);
-      const entries = await tree.readDirectory(dirPath ?? "");
-      return entries.map((entry) => ({
-        name: entry.filename.replace(/^\.\//, ""),
-        isDirectory: entry.type === "Directory",
-        sizeBytes: entry.fileSize,
-        mtime: entry.lastWriteTime,
-        isReparsePoint: entry.fileAttributes.includes("ReparsePoint"),
-      }));
+      const entries = await tree.readDirectory(dirPath ?? "", { signal: opts.signal });
+      return entries.map(toDirEntry);
     } catch (error) {
-      throw toSmbError(error, `list ${share}/${dirPath ?? ""}`);
+      throw toSmbError(error, context);
     }
   }
 
-  async stat(share: string, filePath: string): Promise<FileStat> {
+  async *listIter(share: string, dirPath?: string, opts: AbortOptions = {}): AsyncGenerator<DirEntry, void, undefined> {
+    const context = `list ${share}/${dirPath ?? ""}`;
+    throwIfAborted(opts.signal, context);
+    let tree: Tree;
+    try {
+      tree = await this.treeFor(share);
+    } catch (error) {
+      throw toSmbError(error, context);
+    }
+    // The handle closes when the pages end, when the consumer stops early
+    // (return() on this iterator closes the inner one) or on an error.
+    const pages = tree.readDirectoryPages(dirPath ?? "", { signal: opts.signal });
+    try {
+      for await (const page of pages) {
+        for (const entry of page) yield toDirEntry(entry);
+      }
+    } catch (error) {
+      throw toSmbError(error, context);
+    }
+  }
+
+  async stat(share: string, filePath: string, opts: AbortOptions = {}): Promise<FileStat> {
+    const context = `stat ${share}/${filePath}`;
+    throwIfAborted(opts.signal, context);
     const tree = await this.treeFor(share);
     const file = new File(tree);
     try {
-      await this.openForStat(file, filePath);
-      const basic = await this.queryInfo(tree, file, FileInfoClass.BasicInformation);
-      const standard = await this.queryInfo(tree, file, FileInfoClass.StandardInformation);
+      await this.openForStat(file, filePath, opts.signal);
+      const basic = await this.queryInfo(tree, file, FileInfoClass.BasicInformation, opts.signal);
+      const standard = await this.queryInfo(tree, file, FileInfoClass.StandardInformation, opts.signal);
       const attributes = basic.readUInt32LE(32);
       return {
         sizeBytes: standard.readBigUInt64LE(8),
@@ -216,7 +266,7 @@ export class SmbSession implements SMBSession {
         readonly: (attributes & 0x1) !== 0,
       };
     } catch (error) {
-      throw toSmbError(error, `stat ${share}/${filePath}`);
+      throw toSmbError(error, context);
     } finally {
       await file.close();
     }
@@ -224,11 +274,14 @@ export class SmbSession implements SMBSession {
 
   // Some servers require FILE_DIRECTORY_FILE to open a directory; opening a
   // file with that flag fails. Try plain first, retry flagged, keep the
-  // first error when both fail.
-  private async openForStat(file: File, filePath: string): Promise<void> {
+  // first error when both fail. A CREATE never takes the signal: an abort
+  // during it is seen once it has answered, so the handle it opened is
+  // known and closes.
+  private async openForStat(file: File, filePath: string, signal?: AbortSignal): Promise<void> {
     try {
       await file.open(filePath, { desiredAccess: FilePipePrinterAccess.ReadAttributes });
     } catch (first) {
+      throwIfAborted(signal, "stat");
       try {
         await file.open(filePath, {
           desiredAccess: FilePipePrinterAccess.ReadAttributes,
@@ -240,17 +293,20 @@ export class SmbSession implements SMBSession {
     }
   }
 
-  private async queryInfo(tree: Tree, file: File, infoClass: number): Promise<Buffer> {
+  private async queryInfo(tree: Tree, file: File, infoClass: number, signal?: AbortSignal): Promise<Buffer> {
+    throwIfAborted(signal, "stat");
     const response = await tree.request({ type: PacketType.QueryInfo }, {
       infoType: InfoType.File,
       fileInfoClass: infoClass,
       fileId: file._id,
       buffer: Buffer.alloc(0),
-    });
+    }, { signal });
     return response.body.buffer as Buffer;
   }
 
-  async readFile(share: string, filePath: string): Promise<Buffer> {
+  async readFile(share: string, filePath: string, opts: AbortOptions = {}): Promise<Buffer> {
+    const context = `read ${share}/${filePath}`;
+    throwIfAborted(opts.signal, context);
     const tree = await this.treeFor(share);
     const file = new File(tree);
     try {
@@ -260,9 +316,33 @@ export class SmbSession implements SMBSession {
           `file ${share}/${filePath} is ${file.fileSize} bytes, above the ${MAX_BUFFERED_FILE_BYTES} byte buffer cap; use download() to stream it`
         );
       }
-      return await file.read();
+      return await file.read({ signal: opts.signal });
     } catch (error) {
-      throw toSmbError(error, `read ${share}/${filePath}`);
+      throw toSmbError(error, context);
+    } finally {
+      await file.close();
+    }
+  }
+
+  async readRange(share: string, filePath: string, offset: number | bigint, length: number, opts: AbortOptions = {}): Promise<Buffer> {
+    const context = `read ${share}/${filePath} at ${offset}`;
+    if (typeof offset === "bigint" ? offset < 0n : !Number.isInteger(offset) || offset < 0) {
+      throw new RangeError(`readRange offset must be a non-negative integer, got ${String(offset)}`);
+    }
+    if (!Number.isInteger(length) || length < 0) throw new RangeError(`readRange length must be a non-negative integer, got ${String(length)}`);
+    if (length > MAX_BUFFERED_FILE_BYTES) {
+      throw new SmbFileTooLargeError(
+        `range of ${length} bytes is above the ${MAX_BUFFERED_FILE_BYTES} byte buffer cap; read smaller ranges, or use download() to stream the file`
+      );
+    }
+    throwIfAborted(opts.signal, context);
+    const tree = await this.treeFor(share);
+    const file = new File(tree);
+    try {
+      await file.open(filePath); // read-only, share read | write | delete
+      return await file.readRange(typeof offset === "bigint" ? offset : BigInt(offset), length, { signal: opts.signal });
+    } catch (error) {
+      throw toSmbError(error, context);
     } finally {
       await file.close();
     }
@@ -324,14 +404,28 @@ export class SmbSession implements SMBSession {
     }
   }
 
-  async download(share: string, remotePath: string, localPath: string): Promise<void> {
+  // A download that fails or aborts leaves no partial file at localPath
+  //: the write stream is closed by pipeline(), then the file is
+  // removed (a missing one is fine), and the original error is thrown.
+  // Only a file this call opened for writing is removed: a failure before
+  // that (the remote CREATE, or a local open that fails) leaves an existing
+  // file at localPath untouched.
+  async download(share: string, remotePath: string, localPath: string, opts: AbortOptions = {}): Promise<void> {
+    const context = `download ${share}/${remotePath} to ${localPath}`;
+    throwIfAborted(opts.signal, context);
     const tree = await this.treeFor(share);
     const file = new File(tree);
+    let written = false;
     try {
       await file.open(remotePath);
-      await pipeline(file.createReadStream(), createWriteStream(localPath));
+      const writer = createWriteStream(localPath);
+      writer.once("open", () => {
+        written = true;
+      });
+      await pipeline(file.createReadStream({ signal: opts.signal }), writer);
     } catch (error) {
-      throw toSmbError(error, `download ${share}/${remotePath} to ${localPath}`);
+      if (written) await rm(localPath, { force: true }).catch(() => undefined);
+      throw toSmbError(error, context);
     } finally {
       await file.close();
     }

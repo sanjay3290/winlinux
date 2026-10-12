@@ -7,6 +7,8 @@ They are not part of `npm test`. They need a VM, and they read all targets and s
 |---|---|---|
 | WinRM | `npm run test:live -w @winlinux/winrm` | 0 all pass, 1 a scenario failed, 2 env incomplete |
 | SMB | `npm run test:live:windows -w @winlinux/smb2` | 0 all pass, 1 a scenario failed, 2 env incomplete |
+| PSRP | `npm run test:live:psrp -w @winlinux/winrm` | 0 all pass, 1 a scenario failed, 2 env incomplete |
+| Live gate (PSRP and HTTPS sign-in checks, several targets, one Markdown table each) | `npm run live:gate` (repo root) | 0 all pass, 1 a check failed or a fixture is not redacted, 2 a check was not run; see `docs/live-gate.md` |
 
 Neither runner skips a scenario. With the env incomplete, a runner prints what it needs and exits 2.
 The WinRM runner needs more for one scenario than for the rest: without a Kerberos realm it runs every other scenario, prints `# env incomplete: HTTP + Kerberos ...` with what is missing, and exits 2 (or 1 if another scenario failed).
@@ -37,7 +39,24 @@ SMB (`packages/smb2/test/live/windows-live.ts`):
 | SMB: listShares returns the test share | `SMB_SHARE` is in the list with type `disk` |
 | SMB: put then get a file with equal SHA-256 | a 3 MB random file uploads, downloads, and hashes equal; the remote copy is deleted |
 
-The offline test `packages/winrm/test/live-harness.test.ts` runs the same WinRM scenario functions against a fake Windows endpoint inside `npm test`.
+PSRP (`psrp-scenarios.ts`; same env as the WinRM runner):
+
+| Test name | Transport | What passes |
+|---|---|---|
+| PSRP: open and close leave no shell, and the server speaks 2.2 or newer | general | the pool's ShellId is listed while open and gone after close; `protocolversion` is 2.2 or 2.3 |
+| PSRP: state persists in one pool ($x = 1, then $x), and objects carry type names | general | `$x` set in one pipeline is read in the next; `Get-Process` objects have `System.Diagnostics.Process` in their type names |
+| PSRP: error, warning, verbose, debug and information records arrive on their streams | general | each `Write-*` lands on its stream; information only with 2.3 |
+| PSRP: 5 MB of output arrives complete across Receives | general | one 5 MB string and 2000 lines, complete and in order |
+| PSRP: stop() ends Start-Sleep 60 within 2 s, the pool survives and $x is still set | general | Signal stops the pipeline; the pool stays Opened |
+| PSRP: Read-Host with no host fails fast with an error record, exit state Failed | general | the server refuses it within 5 s |
+| PSRP: Out-String -Stream returns formatted lines | general | every output is a string |
+| PSRP: HTTP + NTLM seals every body | HTTP, NTLM | a pipeline runs over sealed bodies |
+| PSRP: HTTPS + Basic runs a pipeline | HTTPS, Basic | a pipeline runs |
+| PSRP: HTTP + Kerberos runs a pipeline | HTTP, Kerberos | needs `WINRM_REALM` and `@winlinux/krb-session-key` |
+
+`WINLINUX_PSRP_RECORD=<dir>` makes the PSRP runner write every decrypted request and response and every PSRP message, redacted (`test/live/redact.ts`), as numbered files; the maintainer reviews them before they go under `test/fixtures/psrp/`, where `test/psrp/fixtures-redacted.test.ts` checks them against the deny list.
+
+The offline test `packages/winrm/test/live-harness.test.ts` runs the same WinRM scenario functions against a fake Windows endpoint inside `npm test`, and `test/psrp-live-harness.test.ts` runs the PSRP scenarios against the fake PSRP endpoint (`test/helpers/fake-psrp.ts`).
 It also proves that each check can fail (lost exit code, dropped stream chunk, orphan shell, wrong password).
 
 ## VM setup

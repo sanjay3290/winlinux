@@ -3,8 +3,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
+import https from 'node:https';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { connect, WinLinuxUsageError, type ConnectOptions } from '../../dist/index.js';
 import { createClient } from '../../dist/client.js';
 import { planAuth } from '../../dist/plan-auth.js';
@@ -150,16 +154,35 @@ describe('CLI --keytab', () => {
     const bin = await mkdtemp(join(tmpdir(), 'fakebin-'));
     const out = await mkdtemp(join(tmpdir(), 'kinitout-'));
     // A fake MIT kinit that records its argv and stdin, then fails, so the
-    // run stops before GSS or any socket.
+    // run stops before GSS and before any token goes out.
     await writeFile(
       join(bin, 'kinit'),
       `#!/bin/sh\necho "$@" > "${out}/args"\ncat > "${out}/stdin"\necho "kinit: Key table entry not found" >&2\nexit 1\n`,
     );
     await chmod(join(bin, 'kinit'), 0o755);
-    const r = await runCli(
-      ['run', '-v', '--keytab', file, '--realm', 'EXAMPLE.TEST', '--tls', 'svc@server.example.test', '--', 'hostname'],
-      { PATH: `${bin}:${process.env.PATH ?? ''}`, WINLINUX_PASSWORD: 'ignored-env-password' },
-    );
+    // Over HTTPS the transport fetches the server certificate with an
+    // unauthenticated probe before the first Kerberos token, so a
+    // listener answers 401 here; the CLI trusts its self-signed test
+    // certificate through NODE_EXTRA_CA_CERTS, since Kerberos refuses
+    // --insecure. --krb-hostname names the SPN host for the loopback IP.
+    const cert = fileURLToPath(new URL('../../../winrm/test/fixtures/tls-test-cert.pem', import.meta.url));
+    const key = fileURLToPath(new URL('../../../winrm/test/fixtures/tls-test-key.pem', import.meta.url));
+    const probes: Array<string | undefined> = [];
+    const listener = https.createServer({ cert: readFileSync(cert), key: readFileSync(key) }, (req, res) => {
+      probes.push(req.headers.authorization);
+      res.writeHead(401, { 'WWW-Authenticate': 'Negotiate' }).end();
+    });
+    await new Promise<void>((resolve) => listener.listen(0, '127.0.0.1', resolve));
+    const port = (listener.address() as AddressInfo).port;
+    let r;
+    try {
+      r = await runCli(
+        ['run', '-v', '--keytab', file, '--realm', 'EXAMPLE.TEST', '--tls', '--winrm-port', String(port), '--krb-hostname', 'server.example.test', 'svc@127.0.0.1', '--', 'hostname'],
+        { PATH: `${bin}:${process.env.PATH ?? ''}`, WINLINUX_PASSWORD: 'ignored-env-password', NODE_EXTRA_CA_CERTS: cert },
+      );
+    } finally {
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
     assert.equal((await readFile(join(out, 'args'), 'utf8')).trim(), `-k -t ${file} svc@EXAMPLE.TEST`);
     assert.equal(await readFile(join(out, 'stdin'), 'utf8'), '', 'nothing on kinit stdin');
     assert.equal(r.code, 2, r.stderr);
@@ -167,5 +190,6 @@ describe('CLI --keytab', () => {
     assert.match(r.stderr, new RegExp(`kerberos keytab ${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
     assert.ok(!r.stderr.includes(KEY_BYTES) && !r.stdout.includes(KEY_BYTES));
     assert.ok(!r.stderr.includes('ignored-env-password'));
+    assert.deepEqual(probes, [undefined], 'one unauthenticated probe reached the listener; no token did');
   });
 });

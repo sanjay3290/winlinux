@@ -1,6 +1,7 @@
 import File from "./File.js";
 import type Session from "./Session.js";
-import Directory from "./Directory.js";
+import type { SendOptions } from "./Client.js";
+import Directory, { type ReadOptions } from "./Directory.js";
 import { EventEmitter } from "events";
 import type Header from "../protocol/smb2/Header.js";
 import * as util from "../protocol/util.js";
@@ -137,13 +138,29 @@ class Tree extends EventEmitter {
     };
   }
 
-  async readDirectory(path: string = "/") {
+  async readDirectory(path: string = "/", options: ReadOptions = {}) {
     const directory = new Directory(this);
     this.registerDirectory(directory);
 
     try {
       await directory.open(path);
-      return await directory.read();
+      return await directory.read(options);
+    } finally {
+      await directory.close();
+    }
+  }
+
+  // The directory one QUERY_DIRECTORY response at a time. The handle
+  // closes when the pages run out, when the consumer stops early (return()
+  // on the iterator, which `break` in a for-await loop does), or on an
+  // error, an abort included.
+  async *readDirectoryPages(path: string = "/", options: ReadOptions = {}) {
+    const directory = new Directory(this);
+    this.registerDirectory(directory);
+
+    try {
+      await directory.open(path);
+      yield* directory.pages(options);
     } finally {
       await directory.close();
     }
@@ -252,13 +269,14 @@ class Tree extends EventEmitter {
     );
   }
 
-  request(header: Header = {}, body: any = {}) {
+  request(header: Header = {}, body: any = {}, options?: SendOptions) {
     return this.session.request(
       {
         treeId: this._id,
         ...header
       },
-      body
+      body,
+      options
     );
   }
 }

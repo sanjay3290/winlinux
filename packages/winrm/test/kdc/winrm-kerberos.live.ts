@@ -7,10 +7,13 @@
 // Linux only: npm run test:kdc -w @winlinux/winrm
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { X509Certificate } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { createAuthProvider } from '@winlinux/auth';
 import type { AuthProvider, Mechanism } from '../../src/auth-provider.js';
+import { tlsServerEndPoint } from '../../src/winrm/channel-binding.js';
 import { WinRMTransport } from '../../src/winrm/transport.js';
-import { connect } from '../../src/winrm/index.js';
+import { WinRMAuthError, connect } from '../../src/winrm/index.js';
 import { mimeParts, startMockServer, type MockHandler, type MockResponse, type RecordedRequest } from '../helpers/mock-server.js';
 import type * as KdcModule from '../../../krb-session-key/dist/test/kdc/kdc.js';
 import type { Acceptor, LocalKdc } from '../../../krb-session-key/dist/test/kdc/kdc.js';
@@ -21,12 +24,17 @@ const kdcModule = (): Promise<typeof KdcModule> =>
 
 // The suite connects to 127.0.0.1. An IP address has no principal, so the
 // Kerberos context refuses it unless the SPN is named. The KDC has
-// HTTP/127.0.0.1, so name it, as kerberosHostname does in the facade.
+// HTTP/127.0.0.1, so name it, as kerberosHostname does in the facade: on
+// the transport's own target object, which later carries the channel
+// binding; a copy would never see it.
 function loopbackProvider(mechanism: Mechanism): AuthProvider {
   const inner = createAuthProvider(mechanism);
   return {
     mechanism: inner.mechanism,
-    createContext: (target, credentials) => inner.createContext({ ...target, spn: 'HTTP/127.0.0.1' }, credentials),
+    createContext: (target, credentials) => {
+      target.spn = 'HTTP/127.0.0.1';
+      return inner.createContext(target, credentials);
+    },
   };
 }
 
@@ -39,7 +47,18 @@ interface ServerStats {
   seen: string[];
   lengthFields: number[];
   mechs: string[];
+  // Per completed context: GSS_C_CHANNEL_BOUND_FLAG from the acceptor.
+  bound?: Array<boolean | null>;
+  // gss_accept_sec_context failures, by message.
+  refusals?: string[];
 }
+
+// The self-signed test certificate (CN and SAN 127.0.0.1). The test:kdc
+// script trusts it through NODE_EXTRA_CA_CERTS, so the transport verifies
+// it as a real one: Kerberos over unverified TLS is refused.
+const pem = (name: string) => readFileSync(new URL(`../fixtures/${name}`, import.meta.url));
+const tls = () => ({ cert: pem('tls-test-cert.pem'), key: pem('tls-test-key.pem') });
+const TEST_CERT_BINDING = tlsServerEndPoint(new X509Certificate(pem('tls-test-cert.pem')).raw);
 
 // An HTTP server that is a GSS acceptor: one acceptor context per TCP
 // connection, like HTTP.sys connection-bound Negotiate auth. It takes the
@@ -51,11 +70,17 @@ interface ServerStats {
 // gss_wrap_iov HEADER|DATA|PADDING (RRC 28, the layout MIT sends),
 // 'plain' is gss_wrap (RRC 0, the trailer at the end), split MS-WSMV style
 // with the last OriginalContent Length bytes as the data.
+// `binding`: the channel bindings the acceptor expects, the
+// tls-server-end-point binding of the certificate the server presents;
+// an initiator whose AP-REQ carries other bindings is refused with a bare
+// 401, as HTTP.sys does. `plaintext`: an HTTPS listener, no MS-WSMV
+// message encryption.
 function acceptorHandler(
   kdc: LocalKdc,
   kdcMod: typeof KdcModule,
   stats: ServerStats,
   reply: 'iov' | 'plain' = 'iov',
+  opts: { binding?: Buffer; plaintext?: boolean } = {},
 ): { handler: MockHandler; close(): void } {
   const acceptors = new Map<number, { acceptor: Acceptor; complete: boolean }>();
   const handler = async (req: RecordedRequest): Promise<MockResponse> => {
@@ -71,12 +96,23 @@ function acceptorHandler(
     if (!conn.complete) {
       const m = /^Negotiate\s+([A-Za-z0-9+/=]+)$/.exec(req.headers.authorization ?? '');
       if (!m?.[1]) return { status: 401, headers: { 'WWW-Authenticate': 'Negotiate' } };
-      const r = await conn.acceptor.accept(Buffer.from(m[1], 'base64'));
+      let r;
+      try {
+        r = await conn.acceptor.accept(Buffer.from(m[1], 'base64'), opts.binding);
+      } catch (err) {
+        (stats.refusals ??= []).push((err as Error).message);
+        return { status: 401, headers: { 'WWW-Authenticate': 'Negotiate' } };
+      }
       if (r.token) headers['WWW-Authenticate'] = `Negotiate ${r.token.toString('base64')}`;
       if (!r.complete) return { status: 401, headers };
       conn.complete = true;
       stats.mechs.push(await conn.acceptor.mech());
+      (stats.bound ??= []).push(r.bound);
       if (req.body.length === 0) return { status: 200, headers };
+    }
+    if (opts.plaintext) {
+      stats.seen.push(req.body.toString('utf8'));
+      return { status: 200, headers: { ...headers, 'Content-Type': 'application/soap+xml;charset=UTF-8' }, body: RESPONSE_SOAP };
     }
     const [part] = mimeParts(req.body);
     if (!part) return { status: 400, body: 'expected one encrypted part' };
@@ -237,6 +273,64 @@ describe('WinRM transport: Kerberos message encryption over HTTP against a real 
     assert.equal(stats.seen.length, 1);
     assert.match(stats.seen[0] ?? '', /wsman\/1\/windows\/shell/);
     assert.deepEqual(stats.mechs.length, 1);
+  });
+
+  // Over HTTPS the transport opens the socket with an unauthenticated probe,
+  // reads the server certificate, and the real Kerberos provider (on the
+  // addon) binds its AP-REQ to it. The acceptor is given the same binding
+  // and reports GSS_C_CHANNEL_BOUND_FLAG.
+  for (const mechanism of ['kerberos', 'negotiate'] as Mechanism[]) {
+    it(`${mechanism} over verified HTTPS: the AP-REQ carries the tls-server-end-point binding of the server certificate`, async () => {
+      const stats: ServerStats = { seen: [], lengthFields: [], mechs: [] };
+      const acceptor = acceptorHandler(kdc, kdcMod, stats, 'iov', { binding: TEST_CERT_BINDING, plaintext: true });
+      const server = await startMockServer(acceptor.handler, { tls: tls() });
+      const transport = new WinRMTransport({
+        host: '127.0.0.1',
+        port: server.port,
+        tls: true,
+        authProvider: loopbackProvider(mechanism),
+        credentials: { username: kdcMod.USER, realm: kdcMod.REALM, useTicketCache: true },
+      });
+      try {
+        assert.equal(await transport.post(REQUEST_SOAP), RESPONSE_SOAP);
+        assert.equal(await transport.post(REQUEST_SOAP), RESPONSE_SOAP);
+      } finally {
+        await transport.close();
+        acceptor.close();
+        await server.close();
+      }
+      assert.deepEqual(stats.seen, [REQUEST_SOAP, REQUEST_SOAP]);
+      assert.deepEqual(stats.refusals ?? [], []);
+      assert.equal(stats.bound?.length, 1, 'one context');
+      if (stats.bound?.[0] !== null) assert.equal(stats.bound?.[0], true, 'the acceptor matched the binding (MIT krb5 1.19+)');
+      assert.equal(server.requests[0]?.headers.authorization, undefined, 'the probe carries no token');
+      assert.match(server.requests[1]?.headers.authorization ?? '', /^Negotiate \S/, 'the AP-REQ follows on the same connection');
+      assert.equal(new Set(server.requests.map((r) => r.socketId)).size, 1, 'probe, handshake and requests share one socket');
+    });
+  }
+
+  it('an acceptor that expects another certificate refuses the bound AP-REQ, and the sign-in fails', async () => {
+    const stats: ServerStats = { seen: [], lengthFields: [], mechs: [] };
+    const other = Buffer.concat([Buffer.from('tls-server-end-point:', 'ascii'), Buffer.alloc(32, 0xab)]);
+    const acceptor = acceptorHandler(kdc, kdcMod, stats, 'iov', { binding: other, plaintext: true });
+    const server = await startMockServer(acceptor.handler, { tls: tls() });
+    const transport = new WinRMTransport({
+      host: '127.0.0.1',
+      port: server.port,
+      tls: true,
+      authProvider: loopbackProvider('kerberos'),
+      credentials: { username: kdcMod.USER, realm: kdcMod.REALM, useTicketCache: true },
+    });
+    try {
+      await assert.rejects(transport.post(REQUEST_SOAP), WinRMAuthError);
+    } finally {
+      await transport.close();
+      acceptor.close();
+      await server.close();
+    }
+    assert.equal(stats.refusals?.length, 1);
+    assert.match(stats.refusals?.[0] ?? '', /bindings/i, 'gss_accept_sec_context refused the bindings');
+    assert.deepEqual(stats.seen, []);
   });
 
   it('a flipped byte in a sealed response fails with a tamper error, and the next request still works', async () => {

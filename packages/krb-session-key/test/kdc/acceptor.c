@@ -5,7 +5,12 @@
 // seals replies for the client to unwrap. Linux (MIT krb5) only.
 //
 // Line protocol on stdin/stdout, base64 arguments:
-//   accept <token>          -> "token <b64>" or "token -", then "complete 0|1"
+//   accept <token> [<cb>]   -> "token <b64>" or "token -", then "complete 0|1",
+//                              then "bound 0|1" (GSS_C_CHANNEL_BOUND_FLAG: the
+//                              initiator's bindings matched <cb>; "bound -" when
+//                              the library has no such flag). <cb> is the base64
+//                              application_data of channel bindings with no
+//                              addresses, the shape the addon sends.
 //   unwrap <header> <data>  -> "plain <b64>"       (gss_unwrap_iov HEADER|DATA: the
 //                              addon's earlier path, kept as the strict oracle)
 //   unwrap-token <header> <data> -> "plain <b64>"  (gss_unwrap of header || data: the
@@ -91,11 +96,23 @@ int main(void) {
     OM_uint32 major, minor;
     if (strcmp(cmd, "accept") == 0) {
       char *tok = strtok(NULL, " ");
+      char *cb64 = strtok(NULL, " ");
       gss_buffer_desc in = GSS_C_EMPTY_BUFFER, out = GSS_C_EMPTY_BUFFER;
       if (tok) in.value = b64_decode(tok, &in.length);
-      major = gss_accept_sec_context(&minor, &ctx, GSS_C_NO_CREDENTIAL, &in, GSS_C_NO_CHANNEL_BINDINGS, NULL, &mech,
-                                     &out, NULL, NULL, NULL);
+      struct gss_channel_bindings_struct bindings;
+      gss_channel_bindings_t cb = GSS_C_NO_CHANNEL_BINDINGS;
+      if (cb64) {
+        memset(&bindings, 0, sizeof bindings);
+        bindings.initiator_addrtype = GSS_C_AF_UNSPEC;
+        bindings.acceptor_addrtype = GSS_C_AF_UNSPEC;
+        bindings.application_data.value = b64_decode(cb64, &bindings.application_data.length);
+        cb = &bindings;
+      }
+      OM_uint32 flags = 0;
+      major = gss_accept_sec_context(&minor, &ctx, GSS_C_NO_CREDENTIAL, &in, cb, NULL, &mech, &out, &flags, NULL,
+                                     NULL);
       free(in.value);
+      if (cb64) free(bindings.application_data.value);
       if (GSS_ERROR(major)) {
         gss_error("gss_accept_sec_context", major, minor);
         continue;
@@ -109,6 +126,12 @@ int main(void) {
       }
       gss_release_buffer(&minor, &out);
       printf("complete %d\n", major == GSS_S_COMPLETE ? 1 : 0);
+#ifdef GSS_C_CHANNEL_BOUND_FLAG
+      printf("bound %d\n", (flags & GSS_C_CHANNEL_BOUND_FLAG) ? 1 : 0);
+#else
+      (void)flags;
+      printf("bound -\n");
+#endif
     } else if (strcmp(cmd, "unwrap") == 0) {
       char *h = strtok(NULL, " "), *d = strtok(NULL, " ");
       if (!h || !d) {

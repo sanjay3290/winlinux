@@ -1,7 +1,26 @@
 // Fake module sessions and deps for facade unit tests. Each fake records
 // what the facade asked for; nothing here touches the network.
 import type { AuthProvider, AuthTarget, Credentials, Mechanism, SecurityContext } from '@winlinux/auth';
-import type { WinRMConnectOptions, WinRMSession, CommandResult, OutputChunk, ProcessInfo, ServiceInfo, InputCommandChunk, InputCommandOptions } from '@winlinux/winrm';
+import type {
+  WinRMConnectOptions,
+  WinRMSession,
+  CommandResult,
+  OutputChunk,
+  ProcessInfo,
+  ServiceInfo,
+  InputCommandChunk,
+  InputCommandOptions,
+  InvokeOptions,
+  PSConnectOptions,
+  PSErrorRecord,
+  PSInvocationResult,
+  PSInvocationState,
+  PSPipeline,
+  PSStreamEvent,
+  PSValue,
+  RunspacePool,
+  RunspacePoolState,
+} from '@winlinux/winrm';
 import type { DirEntry, FileStat, SMBConnectOptions, SMBSession } from '@winlinux/smb2';
 import type { ClientDeps } from '../../dist/client.js';
 
@@ -89,6 +108,9 @@ export class FakeSmb implements SMBSession {
   list(share: string, dirPath?: string) {
     return this.listImpl(share, dirPath);
   }
+  async *listIter(share: string, dirPath?: string) {
+    yield* await this.listImpl(share, dirPath);
+  }
   // File operations: every call is recorded; statImpl decides what
   // exists. The default answers a plain file for every path.
   ops: Array<{ op: string; share: string; path: string; to?: string; data?: string }> = [];
@@ -108,6 +130,10 @@ export class FakeSmb implements SMBSession {
     this.ops.push({ op: 'readFile', share, path });
     return Buffer.from('fake-content');
   }
+  async readRange(share: string, path: string, offset: number | bigint, length: number): Promise<Buffer> {
+    this.ops.push({ op: 'readRange', share, path });
+    return Buffer.from('fake-content').subarray(Number(offset), Number(offset) + length);
+  }
   async writeFile(share: string, path: string, data: Buffer | string) {
     this.ops.push({ op: 'writeFile', share, path, data: data.toString() });
   }
@@ -121,12 +147,12 @@ export class FakeSmb implements SMBSession {
     this.ops.push({ op: 'rename', share, path, to });
   }
   uploads: Array<{ localPath: string; share: string; remotePath: string }> = [];
-  downloadImpl: (share: string, remotePath: string, localPath: string) => Promise<void> = async () => undefined;
+  downloadImpl: (share: string, remotePath: string, localPath: string, opts?: { signal?: AbortSignal }) => Promise<void> = async () => undefined;
   async upload(localPath: string, share: string, remotePath: string) {
     this.uploads.push({ localPath, share, remotePath });
   }
-  download(share: string, remotePath: string, localPath: string) {
-    return this.downloadImpl(share, remotePath, localPath);
+  download(share: string, remotePath: string, localPath: string, opts?: { signal?: AbortSignal }) {
+    return this.downloadImpl(share, remotePath, localPath, opts);
   }
   async delete() {}
   mkdir(share: string, path: string) {
@@ -135,6 +161,70 @@ export class FakeSmb implements SMBSession {
   }
   async close() {
     this.closed += 1;
+  }
+}
+
+// A scripted PSRP pool: invokeImpl decides the events and the final
+// state of each pipeline; stop() ends it as Stopped.
+export interface FakeRun {
+  events?: PSStreamEvent[];
+  state?: Exclude<PSInvocationState, 'Running'>;
+  reason?: PSErrorRecord | Error;
+}
+
+export class FakePipeline implements PSPipeline {
+  readonly id = 'fake-pipeline';
+  state: PSInvocationState = 'Running';
+  private readonly done: Promise<FakeRun>;
+  private stopped = false;
+  constructor(run: FakeRun | Promise<FakeRun>) {
+    this.done = Promise.resolve(run);
+  }
+  async stop(): Promise<void> {
+    this.stopped = true;
+    this.state = 'Stopped';
+  }
+  async result(): Promise<PSInvocationResult> {
+    const run = await this.done;
+    const events = run.events ?? [];
+    const state = this.stopped ? 'Stopped' : (run.state ?? 'Completed');
+    this.state = state;
+    return {
+      state,
+      output: events.filter((e): e is { stream: 'output'; value: PSValue } => e.stream === 'output').map((e) => e.value),
+      errors: events.filter((e): e is { stream: 'error'; record: PSErrorRecord } => e.stream === 'error').map((e) => e.record),
+      ...(run.reason !== undefined ? { reason: run.reason } : {}),
+    };
+  }
+  async *[Symbol.asyncIterator](): AsyncIterator<PSStreamEvent> {
+    const run = await this.done;
+    for (const e of run.events ?? []) {
+      if (this.stopped) return;
+      yield e;
+    }
+  }
+}
+
+export class FakePool implements RunspacePool {
+  shellId = 'FAKE-POOL-1';
+  serverProtocolVersion = '2.3';
+  state: RunspacePoolState = 'Opened';
+  applicationPrivateData: PSValue | null = null;
+  closed = 0;
+  invokes: Array<{ script: string; opts: InvokeOptions | undefined }> = [];
+  invokeImpl: (script: string, opts?: InvokeOptions) => FakeRun | Promise<FakeRun> = () => ({ events: [{ stream: 'output', value: 'ok' }] });
+  closeImpl: () => Promise<void> = async () => undefined;
+  invoke(script: string, opts?: InvokeOptions): PSPipeline {
+    this.invokes.push({ script, opts });
+    return new FakePipeline(this.invokeImpl(script, opts));
+  }
+  invokeCommand(): PSPipeline {
+    throw new Error('the fake pool runs scripts only');
+  }
+  async close(): Promise<void> {
+    this.closed += 1;
+    this.state = 'Closed';
+    await this.closeImpl();
   }
 }
 
@@ -148,22 +238,29 @@ export class NullProvider implements AuthProvider {
 // Deps whose connect functions are driven by the test.
 export interface FakeDeps extends ClientDeps {
   winrmOpens: WinRMConnectOptions[];
+  poolOpens: PSConnectOptions[];
   smbOpens: SMBConnectOptions[];
   mechanisms: Mechanism[];
 }
 
 export function fakeDeps(opts: {
   winrm?: (o: WinRMConnectOptions) => Promise<WinRMSession>;
+  pool?: (o: PSConnectOptions) => Promise<RunspacePool>;
   smb?: (o: SMBConnectOptions) => Promise<SMBSession>;
   closeTimeoutMs?: number;
 }): FakeDeps {
   const deps: FakeDeps = {
     winrmOpens: [],
+    poolOpens: [],
     smbOpens: [],
     mechanisms: [],
     winrmConnect: async (o) => {
       deps.winrmOpens.push(o);
       return (opts.winrm ?? (async () => new FakeWinrm()))(o);
+    },
+    openRunspacePool: async (o) => {
+      deps.poolOpens.push(o);
+      return (opts.pool ?? (async () => new FakePool()))(o);
     },
     smbConnect: async (o) => {
       deps.smbOpens.push(o);

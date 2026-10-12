@@ -38,3 +38,9 @@ export class WinRMProtocolError extends WinRMError {
 export class WinRMAbortError extends WinRMError {
   override name = 'AbortError';
 }
+
+// PSRP: the runspace pool is Broken, the server's protocol
+// version is refused, or a message or fragment is malformed.
+export class PSRemotingError extends WinRMError {
+  override name = 'PSRemotingError';
+}

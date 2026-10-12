@@ -4,6 +4,141 @@ All notable changes to winlinux. The five packages (`winlinux`,
 `@winlinux/auth`, `@winlinux/winrm`, `@winlinux/smb2`,
 `@winlinux/krb-session-key`) share one version and one release.
 
+## 1.1.0 — 2026-10-12
+
+For `@winlinux/smb2` users who read large files: `readRange` reads a byte
+range of a file of any size, including one IIS holds open for append;
+`list`, `stat`, `readFile`, `download` and `readRange` take an
+`AbortSignal`; `listIter` walks a large directory page by page.
+`@winlinux/auth` installs with no native build for NTLM-only use.
+Kerberos over HTTPS sends the TLS channel binding.
+
+### Features
+
+- **`@winlinux/smb2`: `readRange`.** `readRange(share, path, offset,
+  length)` returns `[offset, offset + length)` of a file of any size, with
+  share access read, write and delete, so the tail of a log another process
+  appends to can be read; fewer bytes at end of file, none past it.
+- **`@winlinux/smb2`: `AbortSignal` and `listIter`.** `list`, `stat`,
+  `readFile` and `download` take `{ signal }`. On abort the call sends no
+  further request, the request in flight rejects at once, the handle closes
+  and the call rejects with `SmbAbortError` (`name === 'AbortError'`); the
+  session stays usable. `listIter(share, dir)` yields entries per
+  `QUERY_DIRECTORY` response, so a caller can stop early with `break`.
+- **`get` and `get -r` over SMB stop on Ctrl+C.** The transfer signal
+  (`TransferOptions.signal`, the CLI's first Ctrl+C) now reaches smb2's
+  `download`, as it already reached the WinRM route: the request in flight
+  is cut, the local `.part` file is removed and the call rejects with
+  `SmbAbortError` (`get -r`: `WinLinuxAbortError` with the count of files
+  done). The CLI exits 130 with no error line. `put` over SMB does not read
+  the signal yet.
+- **`@winlinux/auth`: the `kerberos` package is an optional dependency.**
+  `npm install @winlinux/auth --omit=optional` runs no native build; NTLM
+  and Basic work without it. The first step of a Kerberos context then
+  fails with an error that says `npm install kerberos`; Negotiate with a
+  password falls back to NTLM, and with the ticket cache alone reports the
+  Kerberos error. `winlinux` depends on `kerberos` directly, so the CLI
+  keeps Kerberos out of the box.
+- **`npm run live:gate`: the live checks as one command.** It runs the
+  PSRP scenarios over HTTP + NTLM, HTTP + Kerberos, HTTPS + Basic and
+  HTTPS + NTLM, and the HTTPS sign-in checks (Kerberos and Negotiate over
+  HTTPS, NTLM over HTTPS with `CbtHardeningLevel` Strict) against every
+  target of a git-ignored `live-targets.json` (or the `WINRM_*`
+  variables), records redacted PSRP fixtures and checks them against the
+  deny list, and prints one redacted Markdown table per target. Passwords
+  come only from environment variables and never print; a check that
+  cannot run is `not run`, never `pass`. Runbook: `docs/live-gate.md`.
+
+### Security hardening
+
+- **Kerberos channel binding over HTTPS.** With
+  `@winlinux/krb-session-key`, a Kerberos or Negotiate sign-in to WinRM
+  over HTTPS binds its AP-REQ to the server's TLS certificate (RFC 5929
+  `tls-server-end-point`, the binding NTLM already sent): the transport
+  fetches the certificate with an unauthenticated probe before the first
+  token, and the addon passes the binding to `gss_init_sec_context`. A
+  server with `CbtHardeningLevel = Strict` checks it. The `kerberos`
+  package sends none; `--tls --insecure` stays refused for Kerberos. The
+  addon's native code changed, so its prebuilt binaries are rebuilt.
+- **The Kerberos token goes on the socket the probe bound.** Over HTTPS
+  the first Kerberos or Negotiate token carries the binding of the
+  certificate the unauthenticated probe saw. A proxy or load balancer that
+  closes the connection after the probe's 401 moves that token to a new
+  socket: when the new socket's certificate differs, the sign-in now fails
+  with `WinRMAuthError` and is not retried, instead of sending a token
+  bound to the wrong peer. The same certificate on a new socket signs in as
+  before. The HTTPS agent no longer resumes TLS sessions, because Node
+  reports no peer certificate on a resumed socket, which left a
+  re-authentication after a dropped connection unbound.
+
+### Fixes
+
+- **`@winlinux/smb2`: an aborted or failed `download` leaves no partial
+  file.** When the signal aborts or a READ fails mid-transfer, the
+  truncated file at the local path is removed before the call rejects with
+  the original error. A successful download is unchanged.
+- **`@winlinux/smb2`: a connect timeout has code `ETIMEDOUT`.** The cause
+  of an `SmbConnectionError` from a TCP connect that times out now has
+  `code: 'ETIMEDOUT'`, like the `ENOTFOUND` and `ECONNREFUSED` causes. Its
+  message stays `connect_timeout`.
+
+### Experimental
+
+`winlinux pwsh -c`, `invokePowerShell`, `openPowerShell` and
+`openRunspacePool` (PowerShell Remoting, PSRP) are tested against a
+scripted PSRP endpoint only. They are not yet verified on a real Windows
+Server; their behaviour can change in a minor release.
+
+- **`winlinux pwsh -c <script>` and PowerShell sessions in the library.**
+  One PSRP pipeline on the server, with the WinRM sign-in of the client:
+  formatted lines on stdout, error, warning, verbose and debug records on
+  stderr as PowerShell prints them, or one JSON value with `--json`;
+  `--configuration <name>`; exit 4 when the pipeline failed or wrote an
+  error record, 130 on Ctrl+C. `client.openPowerShell()` gives a session
+  whose pipelines share one runspace; `client.invokePowerShell(script)`
+  runs one pipeline. An auth failure latches with the WinRM slot. No host
+  is offered yet, so a script that prompts fails on the server. Needs
+  PowerShell 3.0 or newer.
+- **`@winlinux/winrm`: PSRP runspace pool and pipeline.**
+  `openRunspacePool` opens one runspace on the server over the existing
+  transport (SESSION_CAPABILITY and INIT_RUNSPACEPOOL in the Create,
+  protocol 2.3 claimed, 2.2 or newer accepted), `invoke` and
+  `invokeCommand` run a pipeline (CREATE_PIPELINE by Command and Send,
+  input values with back-pressure, every output stream as events,
+  `Out-String -Stream` on request), `stop` cuts the Receive and sends
+  Signal `ctrl_c`, and `close` deletes the shell. A fault on a pipeline
+  message fails the pipeline and signals it; a fault on a pool message
+  breaks the pool and deletes the shell. No host is offered.
+- **`@winlinux/winrm`: CLIXML serializer and deserializer subset.**
+  `deserializeClixml` reads the common CLIXML elements into plain values
+  and `PSObject` (references, type-name references, cycles, containers,
+  enums, error, progress and information records) and turns an unknown
+  element into `kind: 'unknown'` instead of throwing; `serializeClixml`
+  writes the subset the client sends, with `RefId` and `TNRef` reuse per
+  message and the `_xHHHH_` escaping of MS-PSRP 2.2.5.3.2; `toJson` is the
+  `--json` view.
+- **`@winlinux/winrm`: PSRP message and fragment codec.** `encodeMessage`
+  and `decodeMessage` read and write the 40-byte MS-PSRP message header
+  (GUIDs in .NET byte order, a UTF-8 byte order mark on server data
+  skipped); `encodeFragments` splits a message into fragments of at most
+  32768 bytes and `Defragmenter` reassembles them per target, refusing an
+  out-of-order fragment, more than 16 messages in progress or a message
+  above 64 MiB with the new `PSRemotingError`.
+- **`@winlinux/winrm`: WS-Man envelopes for PSRP.** The envelope builder
+  takes a resource URI, an optional `wsmv:SessionId` header and
+  `MustComply` options; new builders produce the PSRP Create
+  (`creationXml`), Command (empty `rsp:Command`, base64 `rsp:Arguments`),
+  Receive (`stdout`, with or without a CommandId), Send (`stdin` or `pr`)
+  and Signal (`powershell/signal/ctrl_c`) messages, and
+  `parsePsrpReceiveResponse` reads a ReceiveResponse without an exit code.
+  The WinRS envelopes are byte-identical to before.
+- **`@winlinux/winrm` tests: fake PSRP endpoint, fixture recorder, PSRP
+  live scenarios.** `npm test` runs the PSRP scenarios against a fake PSRP
+  endpoint; `npm run test:live:psrp` runs them against a Windows Server,
+  with `WINLINUX_PSRP_RECORD=<dir>` writing redacted fixtures that a
+  deny-list test guards. `PSConnectOptions.trace` reports every request,
+  response and PSRP message for that recorder.
+
 ## 1.0.0 — 2026-10-11
 
 First public release: `npm install winlinux`. SSH-like access to Windows

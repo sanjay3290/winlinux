@@ -338,7 +338,7 @@ describe('cli against the winrm mock', () => {
     assert.match(help.stdout, /^Usage:/);
     const version = await runCli(['-V']);
     assert.equal(version.code, 0);
-    assert.equal(version.stdout, '1.0.0\n');
+    assert.equal(version.stdout, '1.1.0\n');
   });
 
   it('put with a missing local file exits 1 naming the local path and never opens SMB', async () => {

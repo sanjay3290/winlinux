@@ -5,9 +5,10 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, X509Certificate } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import type { AuthProvider, AuthTarget, Credentials, SecurityContext, StepResult } from '../src/auth-provider.js';
+import type { AuthProvider, AuthTarget, Credentials, Mechanism, SecurityContext, StepResult } from '../src/auth-provider.js';
 import { TLS_SERVER_END_POINT_PREFIX, tlsServerEndPoint, tlsServerEndPointHashName, type ChannelBoundTarget } from '../src/winrm/channel-binding.js';
 import { WinRMTransport } from '../src/winrm/transport.js';
+import { WinRMAuthError } from '../src/winrm/errors.js';
 import { CREDENTIALS, fakeNtlmUnwrap, fakeNtlmWrap } from './helpers/stub-auth.js';
 import { mimeUnwrap, mimeWrap, negotiateGate, startMockServer } from './helpers/mock-server.js';
 import { AV_CHANNEL_BINDINGS, challengeWithTimestamp, ntlmsspType, type AvPair, type3AvPairs } from './helpers/ntlm-wire.js';
@@ -64,8 +65,10 @@ describe('tls-server-end-point hash selection (RFC 5929 4.1)', () => {
 // step() call, so the test sees what the provider would have read.
 class SnapshotContext implements SecurityContext {
   complete = false;
+  negotiatedMechanism?: Mechanism;
   readonly bindingsAtStep: Array<Buffer | undefined> = [];
-  constructor(private readonly target: ChannelBoundTarget) {}
+  // picks: what a Negotiate context reports after its first step.
+  constructor(private readonly target: ChannelBoundTarget, private readonly picks?: Mechanism) {}
   // The fake NTLM layout, so the context also serves plain HTTP.
   async wrap(plaintext: Buffer): Promise<Buffer> {
     return fakeNtlmWrap(plaintext);
@@ -76,6 +79,7 @@ class SnapshotContext implements SecurityContext {
   async step(inputToken?: Buffer): Promise<StepResult> {
     const b = this.target.channelBindings;
     this.bindingsAtStep.push(b ? Buffer.from(b) : undefined);
+    if (this.picks) this.negotiatedMechanism = this.picks;
     if (inputToken === undefined) return { output: Buffer.from('initial-token'), complete: false };
     this.complete = true;
     return { output: Buffer.from('response-token'), complete: true };
@@ -83,10 +87,10 @@ class SnapshotContext implements SecurityContext {
 }
 
 class SnapshotProvider implements AuthProvider {
-  readonly mechanism = 'ntlm' as const;
   readonly contexts: SnapshotContext[] = [];
+  constructor(readonly mechanism: Mechanism = 'ntlm', private readonly picks?: Mechanism) {}
   createContext(target: AuthTarget, _credentials: Credentials): SecurityContext {
-    const ctx = new SnapshotContext(target as ChannelBoundTarget);
+    const ctx = new SnapshotContext(target as ChannelBoundTarget, this.picks);
     this.contexts.push(ctx);
     return ctx;
   }
@@ -209,5 +213,233 @@ describe('real NTLM AUTHENTICATE over the TLS mock', () => {
     const expected = channelBindingsHash(tlsServerEndPoint(der('tls-test-cert.pem')));
     assert.equal(cbt.value.toString('hex'), expected.toString('hex'));
     assert.ok(!cbt.value.equals(Buffer.alloc(16)), 'never all zero');
+  });
+});
+
+// Kerberos carries its binding in its first token: over TLS the
+// transport opens the socket with an unauthenticated probe first, so the
+// first step already sees the certificate's binding. The probe mechanics
+// are the same for a 'kerberos' and a 'negotiate' provider (both may send
+// an AP-REQ first); 'negotiate' is used here because a Kerberos provider
+// over unverified TLS is refused before any socket (kerberos-insecure
+// test), and the test certificate is self-signed. The real Kerberos
+// providers run over verified TLS in test/kdc/winrm-kerberos.live.ts.
+describe('Kerberos learns the binding before its first token', () => {
+  const expectedBinding = tlsServerEndPoint(der('tls-test-cert.pem'));
+
+  it('negotiate over TLS: an unauthenticated probe comes first, on the socket the handshake then uses', async () => {
+    const gate = negotiateGate();
+    const server = await startMockServer((req) => gate.check(req) ?? { status: 200, body: '<ok/>' }, { tls: tlsOptions() });
+    const provider = new SnapshotProvider('negotiate');
+    const transport = new WinRMTransport({ host: '127.0.0.1', port: server.port, tls: true, tlsVerify: false, authProvider: provider, credentials: CREDENTIALS });
+    try {
+      assert.equal(await transport.post('<soap/>'), '<ok/>');
+    } finally {
+      await transport.close();
+      await server.close();
+    }
+    const [ctx] = provider.contexts;
+    assert.ok(ctx);
+    assert.equal(ctx.bindingsAtStep.length, 2);
+    assert.ok(ctx.bindingsAtStep[0]?.equals(expectedBinding), 'the first step sees the binding');
+    assert.ok(ctx.bindingsAtStep[1]?.equals(expectedBinding));
+    assert.equal(server.requests.length, 3, 'probe, first token, second token');
+    assert.equal(server.requests[0]?.headers.authorization, undefined, 'the probe carries no token');
+    assert.equal(server.requests[0]?.body.length, 0);
+    assert.match(server.requests[1]?.headers.authorization ?? '', /^Negotiate \S/);
+    assert.deepEqual(server.requests.map((r) => r.socketId), [0, 0, 0], 'one keep-alive socket for the probe and the handshake');
+  });
+
+  it('probes again for the fresh context of a re-authentication', async () => {
+    const gate = negotiateGate();
+    const server = await startMockServer(
+      (req, index) => {
+        if (index === 3) return { status: 401, headers: { 'WWW-Authenticate': 'Negotiate' } }; // the server forgot us
+        return gate.check(req) ?? { status: 200, body: '<ok/>' };
+      },
+      { tls: tlsOptions() },
+    );
+    const provider = new SnapshotProvider('negotiate');
+    const transport = new WinRMTransport({ host: '127.0.0.1', port: server.port, tls: true, tlsVerify: false, authProvider: provider, credentials: CREDENTIALS });
+    try {
+      assert.equal(await transport.post('<soap>one</soap>'), '<ok/>');
+      assert.equal(await transport.post('<soap>two</soap>'), '<ok/>');
+    } finally {
+      await transport.close();
+      await server.close();
+    }
+    assert.equal(provider.contexts.length, 2);
+    for (const ctx of provider.contexts) {
+      assert.ok(ctx.bindingsAtStep[0]?.equals(expectedBinding));
+      assert.ok(ctx.bindingsAtStep[1]?.equals(expectedBinding));
+    }
+    const unauthenticated = server.requests.filter((r) => r.headers.authorization === undefined);
+    // The first probe, the authenticated request the server forgot, and
+    // the probe of the second handshake.
+    assert.equal(unauthenticated.length, 3);
+  });
+
+  it('sends no probe over plain HTTP, where there is no certificate to bind', async () => {
+    const gate = negotiateGate();
+    const server = await startMockServer((req) => {
+      const denied = gate.check(req);
+      if (denied) return denied;
+      const wrapped = mimeWrap(`<ok>${mimeUnwrap(req.body, fakeNtlmUnwrap)}</ok>`, fakeNtlmWrap);
+      return { status: 200, headers: { 'Content-Type': wrapped.contentType }, body: wrapped.body };
+    });
+    // Over plain HTTP the body is sealed by the mechanism Negotiate picked.
+    const provider = new SnapshotProvider('negotiate', 'ntlm');
+    const transport = new WinRMTransport({ host: '127.0.0.1', port: server.port, tls: false, authProvider: provider, credentials: CREDENTIALS });
+    try {
+      assert.equal(await transport.post('<soap/>'), '<ok><soap/></ok>');
+    } finally {
+      await transport.close();
+      await server.close();
+    }
+    assert.match(server.requests[0]?.headers.authorization ?? '', /^Negotiate \S/, 'the first request carries the first token');
+    assert.deepEqual(provider.contexts[0]?.bindingsAtStep, [undefined, undefined]);
+  });
+
+  it('an NTLM provider still sends its NEGOTIATE first: no probe', async () => {
+    const gate = negotiateGate();
+    const server = await startMockServer((req) => gate.check(req) ?? { status: 200, body: '<ok/>' }, { tls: tlsOptions() });
+    const provider = new SnapshotProvider('ntlm');
+    const transport = new WinRMTransport({ host: '127.0.0.1', port: server.port, tls: true, tlsVerify: false, authProvider: provider, credentials: CREDENTIALS });
+    try {
+      assert.equal(await transport.post('<soap/>'), '<ok/>');
+    } finally {
+      await transport.close();
+      await server.close();
+    }
+    assert.equal(server.requests.length, 2);
+    assert.match(server.requests[0]?.headers.authorization ?? '', /^Negotiate \S/);
+  });
+});
+
+// The first token carries the binding of the probe's certificate, so it
+// must go out on the socket the probe bound. A proxy or load
+// balancer that closes the connection after the probe's 401 moves the
+// token to a new socket: with a different certificate there the sign-in
+// fails and is not retried; with the same certificate it goes on.
+describe('the first token goes on the socket the probe bound', () => {
+  const otherTls = () => ({ cert: pem('tls-test-cert-2.pem'), key: pem('tls-test-key-2.pem') });
+
+  it('a different certificate on the new socket fails the sign-in with WinRMAuthError before the token goes out', async () => {
+    const gate = negotiateGate();
+    const server = await startMockServer(
+      (req, index) => {
+        if (index === 0) {
+          // The probe's 401 closes the connection; the next one presents
+          // another certificate.
+          server.setSecureContext(otherTls());
+          return { status: 401, headers: { 'WWW-Authenticate': 'Negotiate', Connection: 'close' } };
+        }
+        return gate.check(req) ?? { status: 200, body: '<ok/>' };
+      },
+      { tls: tlsOptions() },
+    );
+    const provider = new SnapshotProvider('negotiate');
+    const transport = new WinRMTransport({ host: '127.0.0.1', port: server.port, tls: true, tlsVerify: false, authProvider: provider, credentials: CREDENTIALS });
+    try {
+      await assert.rejects(transport.post('<soap/>'), (err: unknown) => {
+        assert.ok(err instanceof WinRMAuthError, String(err));
+        assert.match(err.message, /first token would go out on a new TLS connection whose server certificate differs/);
+        assert.match(err.message, /token was not sent/);
+        assert.match(err.message, /not retried/);
+        return true;
+      });
+    } finally {
+      await transport.close();
+      await server.close();
+    }
+    // The peer with the other certificate never receives the token: the
+    // only request the server saw is the probe.
+    assert.equal(server.requests.length, 1, 'the probe only: no first token, no retry');
+    assert.equal(server.requests[0]?.headers.authorization, undefined);
+    assert.equal(gate.handshakes, 0);
+    // The token was bound to the probe's certificate, not the new socket's.
+    assert.ok(provider.contexts[0]?.bindingsAtStep[0]?.equals(tlsServerEndPoint(der('tls-test-cert.pem'))));
+  });
+
+  it('the same certificate on a new socket signs in', async () => {
+    const gate = negotiateGate();
+    const server = await startMockServer(
+      (req, index) => {
+        if (index === 0) return { status: 401, headers: { 'WWW-Authenticate': 'Negotiate', Connection: 'close' } };
+        return gate.check(req) ?? { status: 200, body: '<ok/>' };
+      },
+      { tls: tlsOptions() },
+    );
+    const provider = new SnapshotProvider('negotiate');
+    const transport = new WinRMTransport({ host: '127.0.0.1', port: server.port, tls: true, tlsVerify: false, authProvider: provider, credentials: CREDENTIALS });
+    try {
+      assert.equal(await transport.post('<soap/>'), '<ok/>');
+    } finally {
+      await transport.close();
+      await server.close();
+    }
+    assert.deepEqual(server.requests.map((r) => r.socketId), [0, 1, 1], 'the probe, then the handshake on a new socket');
+    assert.equal(gate.handshakes, 1);
+  });
+
+  it('a re-authentication checks its own probe too', async () => {
+    const gate = negotiateGate();
+    const server = await startMockServer(
+      (req, index) => {
+        // Request 3 is the authenticated post the server forgot: its 401
+        // starts a second handshake. That handshake's probe (request 4)
+        // closes the connection and the certificate changes.
+        if (index === 3) return { status: 401, headers: { 'WWW-Authenticate': 'Negotiate' } };
+        if (index === 4) {
+          server.setSecureContext(otherTls());
+          return { status: 401, headers: { 'WWW-Authenticate': 'Negotiate', Connection: 'close' } };
+        }
+        return gate.check(req) ?? { status: 200, body: '<ok/>' };
+      },
+      { tls: tlsOptions() },
+    );
+    const provider = new SnapshotProvider('negotiate');
+    const transport = new WinRMTransport({ host: '127.0.0.1', port: server.port, tls: true, tlsVerify: false, authProvider: provider, credentials: CREDENTIALS });
+    try {
+      assert.equal(await transport.post('<soap>one</soap>'), '<ok/>');
+      await assert.rejects(transport.post('<soap>two</soap>'), (err: unknown) => err instanceof WinRMAuthError);
+    } finally {
+      await transport.close();
+      await server.close();
+    }
+    assert.equal(server.requests.length, 5, 'probe, two tokens, the forgotten post, the second probe; the second first token is not sent');
+    assert.equal(server.requests[4]?.headers.authorization, undefined);
+  });
+});
+
+// A new socket after a drop must show its certificate: with TLS
+// session resumption Node reports none on the resumed socket, so the
+// re-authentication would send an unbound first token. The agent does not
+// resume sessions.
+describe('a re-authentication on a new socket binds to its certificate', () => {
+  it('the second handshake, on a fresh connection, sees the binding at its first step', async () => {
+    const gate = negotiateGate();
+    const server = await startMockServer(
+      (req, index) => {
+        // The first post succeeds and the server closes the connection;
+        // the next post opens a new socket, which the server has not seen.
+        if (index === 2) return { status: 200, headers: { Connection: 'close' }, body: '<ok/>' };
+        return gate.check(req) ?? { status: 200, body: '<ok/>' };
+      },
+      { tls: tlsOptions() },
+    );
+    const provider = new SnapshotProvider('negotiate');
+    const transport = new WinRMTransport({ host: '127.0.0.1', port: server.port, tls: true, tlsVerify: false, authProvider: provider, credentials: CREDENTIALS });
+    try {
+      assert.equal(await transport.post('<soap>one</soap>'), '<ok/>');
+      assert.equal(await transport.post('<soap>two</soap>'), '<ok/>');
+    } finally {
+      await transport.close();
+      await server.close();
+    }
+    assert.equal(provider.contexts.length, 2);
+    assert.deepEqual(server.requests.map((r) => r.socketId), [0, 0, 0, 1, 1, 1, 1], 'the forgotten post, probe and handshake on the new socket');
+    const expected = tlsServerEndPoint(der('tls-test-cert.pem'));
+    assert.ok(provider.contexts[1]?.bindingsAtStep[0]?.equals(expected), 'the new socket showed its certificate');
   });
 });

@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { connect as smbConnect } from '@winlinux/smb2';
-import { SmbError, SmbNotFoundError, SmbTimeoutError, WinLinuxConnectionError, WinLinuxUsageError } from '../../dist/index.js';
+import { SmbAbortError, SmbError, SmbNotFoundError, SmbTimeoutError, WinLinuxConnectionError, WinLinuxUsageError } from '../../dist/index.js';
 import { createClient, resolveGetDestination } from '../../dist/client.js';
 import { StubAuthProvider as SmbStubProvider } from '../../../smb2/dist-test/test/helpers/stub-provider.js';
 import { MockSmbServer } from '../../../smb2/dist-test/test/mock/server.js';
@@ -81,6 +81,80 @@ describe('file transfers', () => {
       assert.deepEqual(fs.readdirSync(dir), ['report.csv']);
     } finally {
       await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The transfer signal reaches smb2's download. The fake behaves as
+  // smb2 does: it writes, waits for the abort, removes its
+  // partial file and rejects with SmbAbortError. A fake that gets no signal
+  // fails the test at once instead of hanging.
+  it('get passes the transfer signal to smb2 download: an abort leaves no temp or target file', async () => {
+    const dir = tempDir();
+    const dest = path.join(dir, 'big.bin');
+    const session = new FakeSmb();
+    const written = deferred<void>();
+    session.downloadImpl = async (_share, _remote, localPath, opts) => {
+      assert.ok(opts?.signal, 'download got the transfer signal');
+      fs.writeFileSync(localPath, 'some bytes');
+      written.resolve();
+      await new Promise<void>((resolve) => opts.signal?.addEventListener('abort', () => resolve(), { once: true }));
+      fs.rmSync(localPath, { force: true });
+      throw new SmbAbortError(`download C$/big.bin to ${localPath} was aborted`, opts.signal?.reason);
+    };
+    const client = createClient('h', OPTS, fakeDeps({ smb: async () => session }));
+    try {
+      const abort = new AbortController();
+      const getting = client.get('C$', 'big.bin', dest, { signal: abort.signal });
+      getting.catch(() => undefined);
+      await written.promise;
+      assert.equal(fs.readdirSync(dir).length, 1, 'the .part file exists while the transfer runs');
+      abort.abort();
+      await assert.rejects(getting, (err: unknown) => {
+        assert.ok(err instanceof SmbAbortError, String(err));
+        assert.equal(err.name, 'AbortError');
+        assert.equal(err.message, `download C$/big.bin to ${dest} was aborted`, 'names the destination, not the temp file');
+        return true;
+      });
+      assert.deepEqual(fs.readdirSync(dir), [], 'no temp file and no target file');
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('get over the mock SMB server: an abort during the second READ rejects with SmbAbortError and leaves nothing', async () => {
+    const data = Buffer.alloc(200000, 7); // 4 READs of 64 KB
+    const server = new MockSmbServer({
+      securityMode: 0,
+      files: new Map([['big.bin', { data, isDirectory: false }]]),
+      responseDelayMs: (type, nth) => (type === 8 /* READ */ && nth === 2 ? 400 : 0),
+    });
+    const port = await server.listen();
+    const dir = tempDir();
+    const deps = fakeDeps({});
+    deps.smbConnect = async (o) => smbConnect(o);
+    deps.createAuthProvider = () => new SmbStubProvider({ sessionKey: Buffer.alloc(16, 1) });
+    const client = createClient('127.0.0.1', { ...OPTS, smb: { port } }, deps);
+    try {
+      const abort = new AbortController();
+      const dest = path.join(dir, 'big.bin');
+      const getting = client.get('share', 'big.bin', dest, { signal: abort.signal });
+      getting.catch(() => undefined);
+      const deadline = Date.now() + 2000;
+      while (server.seen.filter((r) => r.type === 8).length < 2) {
+        if (Date.now() > deadline) throw new Error('timed out waiting for the second READ');
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      const started = Date.now();
+      abort.abort();
+      await assert.rejects(getting, (err: unknown) => err instanceof SmbAbortError);
+      assert.ok(Date.now() - started < 200, 'rejected before the stalled READ answered');
+      assert.equal(server.seen.filter((r) => r.type === 8).length, 2, 'no further READ went out');
+      assert.deepEqual(fs.readdirSync(dir), [], 'no .part file and no target file');
+    } finally {
+      await client.close();
+      await server.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

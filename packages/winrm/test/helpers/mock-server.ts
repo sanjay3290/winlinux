@@ -24,6 +24,9 @@ export interface MockServer {
   port: number;
   requests: RecordedRequest[];
   connectionCount(): number;
+  // TLS only: the certificate new connections get from now on, as a
+  // load balancer with per-backend certificates would present.
+  setSecureContext(opts: { cert: string | Buffer; key: string | Buffer }): void;
   close(): Promise<void>;
 }
 
@@ -98,6 +101,10 @@ export async function startMockServer(handler: MockHandler, opts?: MockServerOpt
     port: address.port,
     requests,
     connectionCount: () => connections,
+    setSecureContext: (next) => {
+      if (!(server instanceof https.Server)) throw new Error('mock server: setSecureContext needs TLS');
+      server.setSecureContext(next);
+    },
     close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
   };
 }

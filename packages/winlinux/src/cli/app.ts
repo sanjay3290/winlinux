@@ -44,10 +44,11 @@ import {
   takeEnvPassword,
 } from './password.js';
 import { runShell } from './shell.js';
+import { runPwsh } from './pwsh.js';
 import { splitSharePath, type Target } from './target.js';
 import { parseConfig, resolveTarget, type HostConfig, type ProfileSettings } from './config.js';
 
-export const COMMANDS = ['run', 'logs', 'services', 'ps', 'shares', 'ls', 'get', 'put', 'stat', 'mkdir', 'rm', 'rmdir', 'mv'] as const;
+export const COMMANDS = ['run', 'pwsh', 'logs', 'services', 'ps', 'shares', 'ls', 'get', 'put', 'stat', 'mkdir', 'rm', 'rmdir', 'mv'] as const;
 export type Command = (typeof COMMANDS)[number];
 
 const LOGS_OPTIONS = {
@@ -73,8 +74,16 @@ const FILE_OPTIONS = {
   via: { type: 'string' },
 } as const;
 
+// `pwsh -c <script>`, `pwsh --configuration <name>`.
+const PWSH_OPTIONS = {
+  command: { type: 'string', short: 'c' },
+  configuration: { type: 'string' },
+} as const;
+
 // Which subcommands each per-command flag belongs to.
 const FLAG_OWNERS: Record<string, readonly Command[]> = {
+  command: ['pwsh'],
+  configuration: ['pwsh'],
   ...Object.fromEntries(Object.keys(LOGS_OPTIONS).map((k) => [k, ['logs']])),
   status: ['services'],
   name: ['services', 'ps'],
@@ -85,7 +94,7 @@ const FLAG_OWNERS: Record<string, readonly Command[]> = {
   via: ['get', 'put'],
 };
 
-export const LINE_OPTIONS = { json: { type: 'boolean' }, ...LOGS_OPTIONS, ...STATE_OPTIONS, ...FILE_OPTIONS } as const;
+export const LINE_OPTIONS = { json: { type: 'boolean' }, ...LOGS_OPTIONS, ...STATE_OPTIONS, ...FILE_OPTIONS, ...PWSH_OPTIONS } as const;
 
 const OPTIONS = {
   auth: { type: 'string', short: 'a' },
@@ -111,12 +120,14 @@ const OPTIONS = {
   ...LOGS_OPTIONS,
   ...STATE_OPTIONS,
   ...FILE_OPTIONS,
+  ...PWSH_OPTIONS,
 } as const;
 
 export const HELP = `Usage:
   winlinux [flags] <target>                          interactive shell
   winlinux run    [flags] <target> [--] <cmd> [args...]
   winlinux run    [flags] --hosts <list> [--] <cmd> [args...]
+  winlinux pwsh   [flags] <target> -c <script>       one PowerShell pipeline over PSRP
   winlinux logs   [flags] <target>
   winlinux services [flags] <target>
   winlinux ps     [flags] <target>
@@ -172,6 +183,15 @@ run --hosts flags:
   prints one object per host instead. One sign-in serves every host; after an
   auth failure no new host starts. Exit: 0 only if every host ran and exited 0,
   else the smallest per-host code (2 auth, 3 connection, 4 remote).
+pwsh flags:
+  -c, --command <script> the pipeline to run (needed: the interactive session comes later)
+  --configuration <name> the session configuration (default Microsoft.PowerShell)
+  Runs one pipeline in a PowerShell remoting session (PSRP, like Invoke-Command),
+  so Get-Process returns objects and the server formats them. Output goes to
+  stdout, error, warning, verbose and debug records to stderr. --json prints
+  {"output": [...], "errors": [...], "state": "..."} with the objects as JSON.
+  Needs PowerShell 3.0 or newer on the server. Exit 4 when the pipeline failed
+  or wrote an error record.
 get/put flags:
   -r, --recursive        copy a directory tree; symlinks and reparse points are skipped
   --parallel <n>         files in flight with -r (1-${MAX_PARALLEL}, default 1)
@@ -186,6 +206,7 @@ Exit codes: 0 ok, 1 usage, 2 auth, 3 connection, 4 remote command/WinRM error,
 
 export const SHELL_HELP = `Commands (no <target>):
   run <cmd> [args...]   or just <cmd> [args...]
+  pwsh -c <script> [--configuration <name>] [--json]   one PSRP pipeline
   cd [<dir>]            change (or print) the working directory for later lines
   logs [--log <name>] [--max <n>] [--level <1-5>] [--provider <name>] [--since <date>] [--oldest] [--json]
   services [--status <running|stopped>] [--name <substring>] [--json]
@@ -281,6 +302,7 @@ export function buildServiceFilter(values: LineValues): ServiceFilter {
 
 const ARITY: Record<Command, [number, number]> = {
   run: [1, Infinity],
+  pwsh: [0, 0],
   logs: [0, 0],
   services: [0, 0],
   ps: [0, 0],
@@ -428,6 +450,18 @@ export async function execute(
         if (result.exitCode !== 0) io.stderr.write(`winlinux: remote command exited with code ${result.exitCode}\n`);
       }
       return result.exitCode === 0 ? EXIT.ok : EXIT.remote;
+    }
+    case 'pwsh': {
+      if (values.command === undefined) {
+        throw new WinLinuxUsageError('pwsh needs -c <script>; the interactive PowerShell session is not available yet');
+      }
+      if (values.command.trim() === '') throw new WinLinuxUsageError('pwsh -c needs a script');
+      const session = await client.openPowerShell({ ...(values.configuration !== undefined ? { configurationName: values.configuration } : {}), ...(signal ? { signal } : {}) });
+      try {
+        return await runPwsh(session, values.command, io, { json, ...(signal ? { signal } : {}) });
+      } finally {
+        await session.close();
+      }
     }
     case 'logs': {
       const events = await client.readEventLog(buildLogQuery(values));
@@ -615,8 +649,9 @@ export function interruptSubcommand(
 ): Promise<void> {
   abort.abort();
   // get -r / put -r: the abort stops the copy after the files in
-  // flight, which complete (no temp file is left); then close. No time
-  // bound: a second Ctrl+C closes at once and removes the temp file.
+  // flight, which complete for put and abort for get; no temp file
+  // is left either way; then close. No time bound: a second Ctrl+C closes
+  // at once and removes the temp file.
   if (recursive && running !== undefined) return running.then(() => client.close(), () => client.close());
   // Other commands have no abort path: close now, so a stalled get
   // still removes its .part file.
@@ -939,7 +974,14 @@ export async function runCli(argv: string[], io: Io): Promise<number> {
         return exit(EXIT.interrupted);
       }
       interrupted = true;
-      io.stderr.write(recursive ? 'interrupted; finishing the files in flight (Ctrl+C again to stop now)\n' : 'interrupted; closing\n');
+      // get -r stops its downloads in flight; put -r finishes its uploads.
+      io.stderr.write(
+        recursive && parsed.command === 'put'
+          ? 'interrupted; finishing the files in flight (Ctrl+C again to stop now)\n'
+          : recursive
+            ? 'interrupted; stopping the files in flight (Ctrl+C again to stop now)\n'
+            : 'interrupted; closing\n',
+      );
       void interruptSubcommand(command, current, running, abort, recursive).then(() => exit(EXIT.interrupted));
     };
     const command: Command = parsed.command;
@@ -952,7 +994,9 @@ export async function runCli(argv: string[], io: Io): Promise<number> {
     return await running;
   } catch (err) {
     if (err instanceof PromptInterrupted) return EXIT.interrupted;
-    if (err instanceof WinRMAbortError) return EXIT.interrupted;
+    // The aborted transfer or command (WinRMAbortError, SmbAbortError): no
+    // error line, the SIGINT handler has said "interrupted".
+    if (err instanceof WinRMAbortError || (err instanceof Error && err.name === 'AbortError')) return EXIT.interrupted;
     return printError(err, io, secrets, { json, verbose });
   } finally {
     removeSigint?.();

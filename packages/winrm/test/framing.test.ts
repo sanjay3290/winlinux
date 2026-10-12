@@ -1,4 +1,7 @@
 import { describe, it } from 'node:test';
+import { execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import type { SecurityContext } from '../src/auth-provider.js';
@@ -714,17 +717,45 @@ describe('Kerberos over plain HTTP with the IOV split', () => {
     assert.equal(server.requests.length, 0);
   });
 
-  it("on HTTPS with encryption 'always', a context without the split gets the TLS wording", async () => {
-    const provider = kerberosStub({ iov: false });
-    const transport = new WinRMTransport({ host: '127.0.0.1', port: 1, tls: true, encryption: 'always', authProvider: provider, credentials: CREDENTIALS });
-    try {
-      await assert.rejects(
-        transport.post(REQUEST_SOAP),
-        (err: unknown) => err instanceof WinRMProtocolError && !/use HTTPS/.test(err.message) && /'auto' or 'never'/.test(err.message),
-      );
-    } finally {
+  // Over TLS the transport fetches the server certificate with a probe
+  // before the first Kerberos step, so this runs against a mock
+  // HTTPS server. A Kerberos provider over unverified TLS is refused, and
+  // the test certificate is self-signed, so the check runs in a child
+  // process that trusts it through NODE_EXTRA_CA_CERTS.
+  it("on HTTPS with encryption 'always', a context without the split gets the TLS wording, after the probe", async () => {
+    const here = (name: string) => fileURLToPath(new URL(name, import.meta.url));
+    const script = `
+      const { readFileSync } = await import('node:fs');
+      const [mockServerJs, stubAuthJs, transportJs, certPem, keyPem] = process.argv.slice(1);
+      const { startMockServer } = await import(mockServerJs);
+      const { kerberosStub, CREDENTIALS } = await import(stubAuthJs);
+      const { WinRMTransport } = await import(transportJs);
+      const server = await startMockServer(() => ({ status: 401, headers: { 'WWW-Authenticate': 'Negotiate' } }), {
+        tls: { cert: readFileSync(certPem), key: readFileSync(keyPem) },
+      });
+      const transport = new WinRMTransport({ host: '127.0.0.1', port: server.port, tls: true, encryption: 'always', authProvider: kerberosStub({ iov: false }), credentials: CREDENTIALS });
+      let out;
+      try {
+        await transport.post('<x/>');
+        out = { ok: true };
+      } catch (err) {
+        out = { name: err.name, message: err.message };
+      }
+      out.requests = server.requests.map((r) => r.headers.authorization ?? null);
       await transport.close();
-    }
+      await server.close();
+      console.log(JSON.stringify(out));
+    `;
+    const { stdout } = await promisify(execFile)(
+      process.execPath,
+      ['--input-type=module', '-e', script, here('./helpers/mock-server.js'), here('./helpers/stub-auth.js'), here('../src/winrm/transport.js'), here('./fixtures/tls-test-cert.pem'), here('./fixtures/tls-test-key.pem')],
+      { env: { ...process.env, NODE_EXTRA_CA_CERTS: here('./fixtures/tls-test-cert.pem') }, timeout: 30_000 },
+    );
+    const out = JSON.parse(stdout) as { ok?: boolean; name?: string; message?: string; requests: Array<string | null> };
+    assert.equal(out.name, 'WinRMProtocolError', out.message);
+    assert.doesNotMatch(out.message ?? '', /use HTTPS/);
+    assert.match(out.message ?? '', /'auto' or 'never'/);
+    assert.deepEqual(out.requests, [null], 'the probe went out; no token did');
   });
 });
 

@@ -149,6 +149,32 @@ export function parseReceiveResponse(xml: string): ReceivePoll {
   return { stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr), done, exitCode };
 }
 
+// A PSRP ReceiveResponse (MS-PSRP 3.1.5.3.8): every rsp:Stream named
+// stdout, in order, each with the CommandId it carries (none: the pool),
+// and whether a CommandState/Done closed the pipeline. Any other stream
+// name is discarded, and Done needs no ExitCode: a PSRP pipeline ends with
+// a PIPELINE_STATE message instead.
+export interface PsrpReceivePoll {
+  streams: Array<{ commandId?: string; data: Buffer }>;
+  done: boolean;
+}
+
+export function parsePsrpReceiveResponse(xml: string): PsrpReceivePoll {
+  const { body } = throwIfFault(xml);
+  const response = asNode(body['ReceiveResponse']);
+  if (!response) throw new WinRMProtocolError('Receive response has no ReceiveResponse element');
+  const streams: PsrpReceivePoll['streams'] = [];
+  for (const stream of asArray(response['Stream'])) {
+    if (attrOf(stream, 'Name') !== 'stdout') continue;
+    const text = textOf(stream);
+    if (!text) continue;
+    const commandId = attrOf(stream, 'CommandId');
+    streams.push({ ...(commandId ? { commandId } : {}), data: Buffer.from(text, 'base64') });
+  }
+  const done = asArray(response['CommandState']).some((state) => attrOf(state, 'State') === COMMAND_STATE_DONE);
+  return { streams, done };
+}
+
 // Assembles Receive polls into the final command result.
 export class ReceiveAccumulator {
   private out: Buffer[] = [];

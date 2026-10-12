@@ -17,6 +17,9 @@ export type {
   TransferSettings,
   TransferOptions,
   TransferFallbackEvent,
+  PowerShellSession,
+  PowerShellOptions,
+  InvokePowerShellOptions,
 } from './types.js';
 
 export { WinLinuxError, WinLinuxUsageError, WinLinuxAuthError, WinLinuxConnectionError, WinLinuxTransferError } from './errors.js';
@@ -25,9 +28,13 @@ export { WinLinuxAbortError } from './tree.js';
 export type { TreeTransferOptions, TreeTransferSummary, TreeFileEvent, TreeSkipEvent } from './tree.js';
 
 // Pass-through error classes, re-exported unchanged so callers can use instanceof.
-export { WinRMError, WinRMAuthError, WinRMTransportError, WinRMFaultError, WinRMProtocolError, WinRMAbortError } from '@winlinux/winrm';
+export { WinRMError, WinRMAuthError, WinRMTransportError, WinRMFaultError, WinRMProtocolError, WinRMAbortError, PSRemotingError } from '@winlinux/winrm';
+// PSRP: the pipeline and value types a PowerShellSession hands out.
+export type { InvokeOptions, PSCommand, PSErrorRecord, PSInformationRecord, PSInvocationResult, PSInvocationState, PSObject, PSPipeline, PSProgressRecord, PSStreamEvent, PSValue } from '@winlinux/winrm';
+export { isPSObject, toJson as psValueToJson } from '@winlinux/winrm';
 export {
   SmbError,
+  SmbAbortError,
   SmbAccessDeniedError,
   SmbNotFoundError,
   SmbAlreadyExistsError,

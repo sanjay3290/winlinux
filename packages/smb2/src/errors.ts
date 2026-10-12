@@ -26,11 +26,30 @@ export class SmbFileTooLargeError extends SmbError {}
 export class SmbNotADirectoryError extends SmbError {}
 export class SmbIsADirectoryError extends SmbError {}
 export class SmbDirectoryNotEmptyError extends SmbError {}
-// A share (or the server) requires SMB 3.x encryption, which this client
-// cannot negotiate yet. Subclass of SmbAccessDeniedError because the
-// wire status is STATUS_ACCESS_DENIED; callers that only know the parent
-// class keep working.
+// A share (or the server) requires SMB encryption that this connection did
+// not negotiate: a dialect below SMB 3.0, or no cipher in common (the
+// client offers AES-128-GCM and AES-128-CCM). Subclass of
+// SmbAccessDeniedError because the wire status is STATUS_ACCESS_DENIED;
+// callers that only know the parent class keep working.
 export class SmbEncryptionRequiredError extends SmbAccessDeniedError {}
+// The caller's AbortSignal fired. The name is 'AbortError', as for
+// fetch() and other Node APIs, and as WinRMAbortError in @winlinux/winrm.
+// The aborted call sends no more requests and closes its file or directory
+// handle before it rejects; the session stays usable. `cause` is the
+// signal's reason.
+export class SmbAbortError extends SmbError {
+  override name = "AbortError";
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    if (cause !== undefined) (this as { cause?: unknown }).cause = cause;
+  }
+}
+
+// Rejects before any request goes out when the signal is already aborted.
+export function throwIfAborted(signal: AbortSignal | undefined, context: string): void {
+  if (signal?.aborted) throw new SmbAbortError(`${context} was aborted`, signal.reason);
+}
 
 export const formatStatus = (status: number) => `0x${status.toString(16).padStart(8, "0")}`;
 
@@ -72,6 +91,8 @@ export function throwForStatus(status: number, context: string): never {
 // (timeouts, socket errors, fs errors) passes through untouched, except the
 // client's request_timeout which becomes SmbTimeoutError.
 export function toSmbError(error: unknown, context: string): unknown {
+  // An abort names the call that was aborted, not the request in flight.
+  if (error instanceof SmbAbortError) return new SmbAbortError(`${context} was aborted`, (error as { cause?: unknown }).cause);
   if (error instanceof SmbError) return error;
   const status = (error as { header?: { status?: unknown } })?.header?.status;
   if (typeof status === "number") {

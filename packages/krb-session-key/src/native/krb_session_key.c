@@ -206,6 +206,12 @@ typedef struct {
   gss_cred_id_t cred;
   bool complete;
   bool busy;
+  // Channel bindings for every gss_init_sec_context call of this context
+  //: no addresses, application_data = the caller's bytes, for
+  // example the RFC 5929 tls-server-end-point binding of the TLS server
+  // certificate. NULL and 0: GSS_C_NO_CHANNEL_BINDINGS.
+  void *cb_data;
+  size_t cb_len;
 } krb_ctx;
 
 static void release_ctx(krb_ctx *k) {
@@ -217,6 +223,9 @@ static void release_ctx(krb_ctx *k) {
   k->target = GSS_C_NO_NAME;
   k->cred = GSS_C_NO_CREDENTIAL;
   k->complete = false;
+  free(k->cb_data);
+  k->cb_data = NULL;
+  k->cb_len = 0;
 }
 
 static void finalize_ctx(napi_env env, void *data, void *hint) {
@@ -468,14 +477,29 @@ static void exec_step(job *j) {
   krb_ctx *k = j->k;
   OM_uint32 major, minor;
   gss_buffer_desc in = {j->in_len, j->in};
+  // RFC 2744 3.11 channel bindings: unspecified addresses and the
+  // caller's application_data. MIT, Heimdal and Windows all put the MD5
+  // of the packed structure in the Bnd field of the AP-REQ authenticator
+  // checksum (RFC 4121 4.1.1.2), which a server that enforces channel
+  // binding (WinRM with CbtHardeningLevel Strict) compares with its own
+  // TLS certificate. The same bindings go into every call of the context.
+  gss_channel_bindings_t cb = GSS_C_NO_CHANNEL_BINDINGS;
+  struct gss_channel_bindings_struct bindings;
+  if (k->cb_len) {
+    memset(&bindings, 0, sizeof bindings);
+    bindings.initiator_addrtype = GSS_C_AF_UNSPEC;
+    bindings.acceptor_addrtype = GSS_C_AF_UNSPEC;
+    bindings.application_data.length = k->cb_len;
+    bindings.application_data.value = k->cb_data;
+    cb = &bindings;
+  }
   // With the default credential, the first call acquires it from the
   // default ccache. Take the lock so that acquire never sees another
   // context's temporary ccache override (process-wide on Heimdal).
   bool lock = k->cred == GSS_C_NO_CREDENTIAL && k->ctx == GSS_C_NO_CONTEXT;
   if (lock) pthread_mutex_lock(&ccache_lock);
-  major = G(gss_init_sec_context)(&minor, k->cred, &k->ctx, k->target, &OID_MECH_KRB5, REQ_FLAGS, 0,
-                                  GSS_C_NO_CHANNEL_BINDINGS, j->in_len ? &in : GSS_C_NO_BUFFER, NULL,
-                                  &j->out, NULL, NULL);
+  major = G(gss_init_sec_context)(&minor, k->cred, &k->ctx, k->target, &OID_MECH_KRB5, REQ_FLAGS, 0, cb,
+                                  j->in_len ? &in : GSS_C_NO_BUFFER, NULL, &j->out, NULL, NULL);
   if (lock) pthread_mutex_unlock(&ccache_lock);
   if (GSS_ERROR(major)) return fail(j, "gss_init_sec_context", major, minor);
   k->complete = (major == GSS_S_COMPLETE);
@@ -691,15 +715,17 @@ static napi_value js_load(napi_env env, napi_callback_info info) {
   return NULL;
 }
 
+// create(service, ccache?, principal?, channelBindings?): the bindings are
+// a Buffer (or null), copied into the context for every step.
 static napi_value js_create(napi_env env, napi_callback_info info) {
-  size_t argc = 3;
-  napi_value argv[3];
+  size_t argc = 4;
+  napi_value argv[4];
   NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
   const char *err = load_library();
   if (err) return throw_msg(env, err);
   napi_value undef;
   napi_get_undefined(env, &undef);
-  for (size_t i = argc; i < 3; i++) argv[i] = undef;
+  for (size_t i = argc; i < 4; i++) argv[i] = undef;
 
   krb_ctx *k = calloc(1, sizeof *k);
   if (!k) return throw_msg(env, "out of memory");
@@ -714,7 +740,7 @@ static napi_value js_create(napi_env env, napi_callback_info info) {
   job *j = new_job(env, OP_CREATE, k);
   if (!j) return NULL;
   if (!copy_string_arg(env, argv[0], &j->spn) || !j->spn || !copy_string_arg(env, argv[1], &j->ccache) ||
-      !copy_string_arg(env, argv[2], &j->principal)) {
+      !copy_string_arg(env, argv[2], &j->principal) || !copy_buffer_arg(env, argv[3], &k->cb_data, &k->cb_len)) {
     bool pending = false;
     napi_is_exception_pending(env, &pending);
     free_job(env, j);

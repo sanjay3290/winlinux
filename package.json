@@ -1,6 +1,6 @@
 {
   "name": "winlinux",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Connect to Windows servers from Linux and macOS (WinRM + SMB2).",
   "license": "MIT",
@@ -18,7 +18,8 @@
     "check:linux": "bash scripts/check-linux.sh",
     "prebuild:local": "bash scripts/prebuild-local.sh",
     "release": "bash scripts/release.sh",
-    "release:dry": "bash scripts/release.sh --dry-run"
+    "release:dry": "bash scripts/release.sh --dry-run",
+    "live:gate": "npm run live:gate -w @winlinux/winrm"
   },
   "engines": {
     "node": ">=22"

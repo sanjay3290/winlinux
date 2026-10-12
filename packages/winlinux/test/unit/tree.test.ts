@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
-import { connect as smbConnect, SmbError, SmbNotFoundError, type DirEntry } from '@winlinux/smb2';
+import { connect as smbConnect, SmbAbortError, SmbError, SmbNotFoundError, type DirEntry } from '@winlinux/smb2';
 import { createClient } from '../../dist/client.js';
 import { execute, HELP, interruptSubcommand, type Io, type LineValues } from '../../dist/cli/app.js';
 import { exitCodeFor, EXIT } from '../../dist/errors.js';
@@ -231,6 +231,43 @@ describe('getDir and putDir (fake session)', () => {
         return true;
       });
       assert.deepEqual(snapshot(path.join(dir, 'd')), { '1': 'partial' });
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The file in flight gets the signal too: the fake, like smb2
+  // since it learned to, removes its partial file and rejects with SmbAbortError;
+  // getDir still reports WinLinuxAbortError with the files done.
+  it('an abort stops the file in flight: WinLinuxAbortError, exit 130, no temp or partial file, copied files stay', async () => {
+    const dir = tempDir();
+    const smb = new FakeSmb();
+    fakeRemote(smb, { d: [entry('1'), entry('2'), entry('3')] });
+    const abort = new AbortController();
+    const seen: Array<AbortSignal | undefined> = [];
+    smb.downloadImpl = async (_share, remote, local, opts) => {
+      seen.push(opts?.signal);
+      assert.ok(opts?.signal, 'download got the transfer signal');
+      fs.writeFileSync(local, 'partial');
+      if (remote !== 'd/2') return fs.writeFileSync(local, `content of ${remote}`);
+      // The second file: aborted while it runs.
+      setImmediate(() => abort.abort());
+      await new Promise<void>((resolve) => opts.signal?.addEventListener('abort', () => resolve(), { once: true }));
+      fs.rmSync(local, { force: true });
+      throw new SmbAbortError(`download S/${remote} to ${local} was aborted`);
+    };
+    const client = createClient('h', OPTS, fakeDeps({ smb: async () => smb }));
+    try {
+      await assert.rejects(client.getDir('S', 'd', dir, { signal: abort.signal }), (err: unknown) => {
+        assert.ok(err instanceof WinLinuxAbortError, String(err));
+        assert.equal(err.message, 'interrupted after 1 of 3 files');
+        assert.equal(exitCodeFor(err), EXIT.interrupted);
+        return true;
+      });
+      assert.equal(seen.length, 2, 'no third download started');
+      assert.ok(seen.every((s) => s === abort.signal), 'every download got the same signal');
+      assert.deepEqual(snapshot(path.join(dir, 'd')), { '1': 'content of d/1' }, 'the first file stays; nothing of the second');
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });

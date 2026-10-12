@@ -8,6 +8,7 @@ export {
   MAX_BUFFERED_FILE_BYTES,
 } from "./smb-session.js";
 export type {
+  AbortOptions,
   SMBConnectOptions,
   SMBSession,
   SmbSecurityInfo,
@@ -32,6 +33,7 @@ export {
   SmbNotADirectoryError,
   SmbIsADirectoryError,
   SmbDirectoryNotEmptyError,
+  SmbAbortError,
 } from "./errors.js";
 
 export type {

@@ -66,6 +66,18 @@ export class Slot<S extends Closable> {
     return mapped;
   }
 
+  // The latched auth failure, for another session kind that shares this
+  // slot's credentials (the PSRP pools): a refused password must not
+  // be retried on a second path either.
+  get latchedAuthFailure(): WinLinuxAuthError | undefined {
+    return this.stateValue === 'authFailed' ? this.authFailure : undefined;
+  }
+
+  // Latches an auth failure seen on that other path.
+  latch(err: unknown): unknown {
+    return this.remember(err);
+  }
+
   // Clears the auth-failure latch; the next call opens again.
   reset(): void {
     if (this.stateValue !== 'authFailed') return;

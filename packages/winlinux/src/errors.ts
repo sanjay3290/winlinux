@@ -196,6 +196,8 @@ export const EXIT = {
 export function exitCodeFor(err: unknown): number {
   // WinLinuxAbortError (tree.ts): a recursive copy stopped by Ctrl+C.
   if (err instanceof WinLinuxError && err.name === 'WinLinuxAbortError') return EXIT.interrupted;
+  // WinRMAbortError and SmbAbortError: a single copy or command stopped by Ctrl+C.
+  if (err instanceof Error && err.name === 'AbortError') return EXIT.interrupted;
   if (err instanceof WinLinuxUsageError) return EXIT.usage;
   if (err instanceof WinLinuxAuthError) return EXIT.auth;
   if (err instanceof WinLinuxConnectionError) return EXIT.connection;

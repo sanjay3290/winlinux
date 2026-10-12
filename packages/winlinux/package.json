@@ -1,6 +1,6 @@
 {
   "name": "winlinux",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Connect to Windows servers from Linux and macOS: run commands, read event logs, and move files over WinRM and SMB2.",
   "keywords": [
     "windows",
@@ -51,9 +51,10 @@
     "test:live:windows": "npm run build:deps && npm run build && npm run build:test && node dist-test/live/windows.js"
   },
   "dependencies": {
-    "@winlinux/auth": "1.0.0",
-    "@winlinux/smb2": "1.0.0",
-    "@winlinux/winrm": "1.0.0"
+    "@winlinux/auth": "1.1.0",
+    "@winlinux/smb2": "1.1.0",
+    "@winlinux/winrm": "1.1.0",
+    "kerberos": "^7.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
