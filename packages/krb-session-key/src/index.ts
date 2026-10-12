@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 interface NativeBinding {
   load(): void;
-  create(spn: string, ccache?: string | null, principal?: string | null): Promise<NativeHandle>;
+  create(spn: string, ccache?: string | null, principal?: string | null, channelBindings?: Buffer | null): Promise<NativeHandle>;
   step(handle: NativeHandle, token?: Buffer | null): Promise<{ output: Buffer | null; complete: boolean }>;
   wrap(handle: NativeHandle, data: Buffer, protect: boolean): Promise<Buffer>;
   unwrap(handle: NativeHandle, data: Buffer): Promise<Buffer>;
@@ -73,6 +73,14 @@ export interface KrbInit {
   // Credential cache for this context only, for example FILE:/tmp/x/ccache.
   // When absent, the GSS library default (KRB5CCNAME or the system default).
   ccache?: string;
+  // Channel bindings: the application_data of an RFC 2744
+  // gss_channel_bindings_struct with no addresses, for example the RFC 5929
+  // tls-server-end-point binding of the TLS server certificate. They go
+  // into every gss_init_sec_context call, so the AP-REQ carries the MD5 of
+  // the packed structure in its authenticator checksum (RFC 4121 4.1.1.2),
+  // which a server that enforces channel binding compares with its own
+  // certificate. Absent or empty: no bindings.
+  channelBindings?: Buffer;
 }
 
 export class KrbClient {
@@ -86,7 +94,13 @@ export class KrbClient {
   wrapIov?: (data: Buffer) => Promise<WinRMSealed>;
   unwrapIov?: (header: Buffer, data: Buffer) => Promise<Buffer>;
 
-  private constructor(private readonly handle: NativeHandle) {
+  // True when the context was created with channel bindings: every
+  // token it produces is bound to them. The GssClient seam in
+  // @winlinux/auth reads it.
+  readonly channelBound: boolean;
+
+  private constructor(private readonly handle: NativeHandle, channelBound: boolean) {
+    this.channelBound = channelBound;
     if (native().hasIov()) {
       this.wrapIov = async (data) => {
         this.assertLive('wrapIov');
@@ -101,8 +115,11 @@ export class KrbClient {
 
   // service is a host-based name: "cifs@dc1.example.com".
   static async create(service: string, init: KrbInit = {}): Promise<KrbClient> {
-    const handle = await native().create(service, init.ccache ?? null, init.principal ?? null);
-    return new KrbClient(handle);
+    const bindings = init.channelBindings;
+    if (bindings !== undefined && !Buffer.isBuffer(bindings)) throw new TypeError('krb-session-key create: channelBindings must be a Buffer');
+    const bound = bindings !== undefined && bindings.length > 0;
+    const handle = await native().create(service, init.ccache ?? null, init.principal ?? null, bound ? bindings : null);
+    return new KrbClient(handle, bound);
   }
 
   get contextComplete(): boolean {

@@ -330,6 +330,7 @@ export async function startTransferMock(opts: TransferMockOptions = {}): Promise
     port: server.port,
     requests: server.requests,
     connectionCount: server.connectionCount,
+    setSecureContext: server.setSecureContext,
     close: server.close,
     actions: state.actions,
     scripts: state.scripts,

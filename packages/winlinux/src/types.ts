@@ -5,7 +5,7 @@ import type { Mechanism } from '@winlinux/auth';
 // certificate sign-in, which is not a token handshake and stays
 // outside the contract.
 export type AuthMechanism = Mechanism | 'certificate';
-import type { CommandResult, OutputChunk, EventLogQuery, EventRecord, ServiceInfo, ProcessInfo } from '@winlinux/winrm';
+import type { CommandResult, OutputChunk, EventLogQuery, EventRecord, ServiceInfo, ProcessInfo, InvokeOptions, PSInvocationResult, PSPipeline } from '@winlinux/winrm';
 import type { ShareInfo, DirEntry, FileStat } from '@winlinux/smb2';
 import type { TreeTransferOptions, TreeTransferSummary } from './tree.js';
 
@@ -56,10 +56,12 @@ export interface TransferSettings {
 // Per call: overrides the client's `transfer.via` and can stop a WinRM copy.
 export interface TransferOptions {
   via?: TransferVia;
-  // Aborts a copy over WinRM: the client closes the remote command's stdin
-  // (the put script removes its temp file), sends Signal terminate, removes
-  // the local .part file and rejects with WinRMAbortError. SMB copies do
-  // not read it.
+  // Aborts the copy. Over WinRM the client closes the remote command's
+  // stdin (the put script removes its temp file), sends Signal terminate,
+  // removes the local .part file and rejects with WinRMAbortError. An SMB
+  // get stops at the request in flight, removes the local .part file and
+  // rejects with SmbAbortError; an SMB put does not read it yet.
+  // Both abort errors have `name === 'AbortError'`.
   signal?: AbortSignal;
 }
 
@@ -95,6 +97,31 @@ export interface ConnectOptions {
   transfer?: TransferSettings; // how get and put travel
 }
 
+// A PSRP runspace pool on the server: one runspace whose
+// state (variables, modules, the current directory) persists across
+// invoke() calls, until close(). The client offers the server no host, so a
+// script that prompts fails on the server instead of waiting.
+export interface PowerShellSession {
+  readonly host: string;
+  readonly serverProtocolVersion: string;
+  invoke(script: string, opts?: InvokeOptions): PSPipeline;
+  close(): Promise<void>;
+}
+
+export interface PowerShellOptions {
+  // The session configuration; default Microsoft.PowerShell. It names a
+  // server-side endpoint and adds no sign-in risk.
+  configurationName?: string;
+  // Aborts the open.
+  signal?: AbortSignal;
+}
+
+export interface InvokePowerShellOptions extends PowerShellOptions {
+  // Appends `Out-String -Stream -Width n`: the server formats the output
+  // and every output value is a string line.
+  outString?: { width: number };
+}
+
 export interface WinLinuxClient {
   readonly host: string;
   readonly username: string;
@@ -106,6 +133,11 @@ export interface WinLinuxClient {
   runPowerShell(script: string): Promise<CommandResult>;
   runStream(cmd: string, args?: string[], opts?: { cwd?: string; signal?: AbortSignal }): AsyncIterable<OutputChunk>;
   runPowerShellStream(script: string): AsyncIterable<OutputChunk>;
+  // PSRP: a persistent session, or one pipeline in a pool that is
+  // opened and closed for it. Each uses the WinRM sign-in of this client
+  // on its own connection; the WinRS methods above are unchanged.
+  openPowerShell(opts?: PowerShellOptions): Promise<PowerShellSession>;
+  invokePowerShell(script: string, opts?: InvokePowerShellOptions): Promise<PSInvocationResult>;
   readEventLog(query: EventLogQuery): Promise<EventRecord[]>;
   // Service and process state: Get-Service and Get-Process over WinRM.
   listServices(): Promise<ServiceInfo[]>;

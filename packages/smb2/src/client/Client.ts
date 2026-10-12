@@ -11,7 +11,7 @@ import HeaderFlag from "../protocol/smb2/HeaderFlag.js";
 import Smb2PacketType from "../protocol/smb2/PacketType.js";
 import Session, { ProviderAuthenticateOptions } from "./Session.js";
 import * as structureUtil from "../protocol/structureUtil.js";
-import { SmbDialectError, SmbEncryptionRequiredError, SmbError, SmbSigningError } from "../errors.js";
+import { SmbAbortError, SmbDialectError, SmbEncryptionRequiredError, SmbError, SmbSigningError } from "../errors.js";
 import { signMessage, verifySignature } from "../signing.js";
 import {
   Cipher,
@@ -54,6 +54,10 @@ const STATUS_USER_SESSION_DELETED = 0xc0000203;
 export interface SendOptions {
   // Rewrites the serialized message before signing (NEGOTIATE contexts).
   transform?: (message: Buffer) => Buffer;
+  // Rejects the request with SmbAbortError when the signal fires. A
+  // signal that is already aborted sends nothing. The response, if the
+  // server still sends one, has no outstanding request and is discarded.
+  signal?: AbortSignal;
 }
 
 export interface Options {
@@ -132,7 +136,10 @@ class Client extends EventEmitter {
 
     const connectPromise = new Promise<void>((resolve, reject) => {
       this.connectTimeoutId = setTimeout(() => {
-        reject(new Error("connect_timeout"));
+        // code ETIMEDOUT, as a system error has one: callers can read the
+        // cause of an SmbConnectionError the same way for a timeout as for
+        // ENOTFOUND or ECONNREFUSED. The message stays connect_timeout.
+        reject(Object.assign(new Error("connect_timeout"), { code: "ETIMEDOUT" }));
       }, this.connectTimeout);
       this.socket.connect(
         this.port,
@@ -234,6 +241,9 @@ class Client extends EventEmitter {
 
   async send(request: Request, options: SendOptions = {}) {
     if (!this.connected) throw new Error("not_connected");
+    const { signal } = options;
+    const name = () => `${structureUtil.parseEnumValue(Smb2PacketType, request.header.type)}(${request.header.messageId})`;
+    if (signal?.aborted) throw new SmbAbortError(`${name()} was aborted before it was sent`, signal.reason);
 
     // An encrypted message is not signed: AES-CCM/GCM authenticate it.
     const encryptFor = request.header.type === Smb2PacketType.Negotiate || request.header.type === Smb2PacketType.SessionSetup
@@ -264,19 +274,30 @@ class Client extends EventEmitter {
     });
     this.socket.write(Smb2Packet.prefixMessage(wire));
 
+    let onAbort: (() => void) | undefined;
     const sendPromise = new Promise<Response>((resolve, reject) => {
       const requestTimeoutId = setTimeout(
         () => {
           // A late response then has no outstanding request and is discarded.
           this.sentRequests.delete(messageId);
           this.responseCallbackMap.delete(messageId);
-          const err = new Error(`request_timeout: ${structureUtil.parseEnumValue(Smb2PacketType, request.header.type)}(${messageId})`);
+          const err = new Error(`request_timeout: ${name()}`);
           reject(err);
         },
         this.requestTimeout
       );
 
       this.requestTimeoutIdMap.set(messageId, requestTimeoutId);
+
+      if (signal) {
+        onAbort = () => {
+          // As for a timeout: a late response is discarded.
+          this.sentRequests.delete(messageId);
+          this.responseCallbackMap.delete(messageId);
+          reject(new SmbAbortError(`${name()} was aborted`, signal.reason));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
 
       const finishRequest = (response: Response) => {
         response.request = request;
@@ -309,6 +330,7 @@ class Client extends EventEmitter {
       // Clear on failure too, or a failed request keeps the process alive.
       clearTimeout(this.requestTimeoutIdMap.get(messageId));
       this.requestTimeoutIdMap.delete(messageId);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
     }
   }
 

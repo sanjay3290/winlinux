@@ -41,7 +41,7 @@ Fedora, RHEL and Alpine.
 |---|---|---|---|
 | `negotiate` (default) | yes | yes | Kerberos or NTLM, chosen per protocol |
 | `ntlm` | yes | yes | NTLMv2 only, with MIC and channel bindings |
-| `kerberos` | yes | yes | Password (`kinit` into a private ccache), ticket cache (`-K`) or keytab (`--keytab`). Needs the server's DNS name. |
+| `kerberos` | yes | yes | Password (`kinit` into a private ccache), ticket cache (`-K`) or keytab (`--keytab`). Needs the server's DNS name. Channel binding over HTTPS with the addon. |
 | `basic` | HTTPS only | no | |
 | `credssp` | HTTPS (HTTP only with `--credssp-allow-http`) | no | Sends your password to the server; explicit opt-in only. See [Double hop and CredSSP](#double-hop-and-credssp). |
 | `certificate` | HTTPS only | no | TLS client certificate mapped to a local account |
@@ -225,6 +225,7 @@ export WINLINUX_PASSWORD='...'            # or omit it and type it at the no-ech
 
 npx winlinux 'CORP\alice@server'                          # interactive shell
 npx winlinux run    'CORP\alice@server' -- ipconfig /all  # use -- before dash arguments
+npx winlinux pwsh   alice@server -c 'Get-Process | Select -First 3'   # one PSRP pipeline, see below
 npx winlinux logs   --log System --max 10 --level 2 alice@server
 npx winlinux services --status running --name win alice@server   # filtered on the client
 npx winlinux ps     --json --name svchost alice@server
@@ -244,8 +245,12 @@ npx winlinux put -r --parallel 4 alice@server ./site 'D$/www'
 - The interactive shell keeps `cd` across lines (resolved like cmd.exe); other cmd state such as `set` is per line.
   With piped input it exits with the code of the last failing line, counting a non-zero remote exit as 4.
 - `--tls` uses HTTPS (5986); `--insecure` skips certificate checks. Kerberos
-  on WinRM refuses `--tls --insecure`: it sends no channel binding yet, so only
-  a verified certificate ties the ticket to the real server.
+  on WinRM refuses `--tls --insecure`: a server that does not enforce channel
+  binding accepts a ticket relayed by a man in the middle, so the certificate
+  must be verified. Over HTTPS the Kerberos ticket carries the TLS channel
+  binding (`tls-server-end-point`, with `@winlinux/krb-session-key`; the
+  `kerberos` package sends none), which a server with `CbtHardeningLevel =
+  Strict` checks against its certificate.
 - `-a negotiate|ntlm|kerberos|basic|credssp` picks the mechanism (`credssp`:
   see "Double hop and CredSSP" below); `-K` uses the Kerberos
   ticket cache (no password). Kerberos on WinRM over plain HTTP, and Kerberos
@@ -262,8 +267,9 @@ npx winlinux put -r --parallel 4 alice@server ./site 'D$/www'
   existing destination directory receives `<dest>/<name>`, a missing one becomes
   the copy. Symbolic links, devices and reparse points are skipped and reported.
   Each downloaded file lands through a temp file and a rename. A failed file stops
-  the copy (exit 5) and the files already copied stay. Ctrl+C stops after the
-  files in flight (exit 130); a second Ctrl+C stops at once. `--parallel <n>`
+  the copy (exit 5) and the files already copied stay. Ctrl+C stops `get -r` at
+  the files in flight and `put -r` after them (exit 130); a second Ctrl+C stops
+  at once. `--parallel <n>`
   (1-8) keeps several files in flight. Remote names with `..` or separators are
   refused, and nothing is written outside the destination.
 - `rm` refuses a directory and `rmdir` refuses a non-empty one (exit 5); there is
@@ -537,9 +543,54 @@ Set-ADComputer <other-host> -PrincipalsAllowedToDelegateToAccount (Get-ADCompute
 Then sign in with Kerberos (`-a kerberos` or `negotiate` with `--realm`) as
 usual. Prefer this to CredSSP wherever you control the domain.
 
+### PowerShell remoting (pwsh)
+
+> **Experimental in 1.1.0.** `pwsh -c`, `invokePowerShell`, `openPowerShell`
+> and `openRunspacePool` are tested against a scripted PSRP endpoint only,
+> not yet on a real Windows Server. Their behaviour can change in a minor
+> release. `winlinux run` (WinRS) is the stable way to run commands.
+
+`winlinux pwsh <target> -c '<script>'` runs one pipeline through the
+PowerShell Remoting Protocol (PSRP), the protocol behind `Invoke-Command`
+and `Enter-PSSession`, inside the WinRM connection and sign-in the other
+commands use. The server runs the script in a real runspace and formats
+the objects itself (`Out-String -Stream`), so `Get-Process` prints the
+table Windows PowerShell prints. Output goes to stdout; error, warning,
+verbose and debug records to stderr, with the prefixes PowerShell uses;
+`Write-Host` text to stdout. `--json` prints one value,
+`{"output": [...], "errors": [...], "state": "Completed"}`, with each
+object as its properties plus `"@type"` and `"@toString"`.
+`--configuration <name>` picks the session configuration (default
+`Microsoft.PowerShell`). Exit 0 when the pipeline completed with no error
+record, 4 when it failed or wrote one, 130 on Ctrl+C, which stops the
+pipeline on the server before the session closes.
+
+This release runs one pipeline per command: nothing persists from one
+`pwsh -c` to the next, and the script gets no host, so `Read-Host` and
+`Get-Credential` fail on the server at once instead of waiting. The
+interactive session, prompts and reconnect are planned. Needs
+PowerShell 3.0 or newer on the server (protocol 2.2 or newer).
+
+Library: `client.openPowerShell()` returns a session whose `invoke(script)`
+pipelines share one runspace until `close()`; `client.invokePowerShell(script)`
+runs one pipeline in a pool opened for it. Both use the WinRM sign-in of
+the client on their own connection and map errors as `run` does. `run`,
+`logs`, `services` and `ps` stay on WinRS.
+
+```ts
+const ps = await client.openPowerShell();
+await ps.invoke('$x = 41').result();
+const r = await ps.invoke('$x + 1').result(); // { state: 'Completed', output: [42], errors: [] }
+for await (const event of ps.invoke('Get-Process', { outString: { width: 120 } })) {
+  if (event.stream === 'output') console.log(event.value);
+}
+await ps.close();
+```
+
 ## Known limits
 
-- **Not verified live:** Kerberos over HTTPS (5986); Windows Server 2016,
+- **Not verified live:** Kerberos over HTTPS (5986), including its channel
+  binding (proven against a MIT acceptor only); Windows Server 2016,
   2019 and 2025 (only 2022 is tested); WinRM with
   `CbtHardeningLevel = Strict`; SMB 3.x encryption against Windows Server. Keytab sign-in and the CredSSP double hop are proven against test
   servers, not against a real Windows domain.
@@ -560,8 +611,12 @@ usual. Prefer this to CredSSP wherever you control the domain.
   that fails, the install still succeeds and Kerberos falls back to the
   `kerberos` package, without SMB signing and without Kerberos over plain
   HTTP.
-- **The `kerberos` dependency** downloads its prebuilt binary from GitHub at
-  install time. Without access to GitHub it compiles from source.
+- **The `kerberos` package** downloads its prebuilt binary from GitHub at
+  install time. Without access to GitHub it compiles from source. `winlinux`
+  depends on it; for `@winlinux/auth` it is an optional dependency,
+  so a library consumer that uses NTLM or Basic only can install with
+  `--omit=optional` and skip the native build. Without it, a Kerberos
+  sign-in fails with an error that says `npm install kerberos`.
 - **Interactive shell:** `cd` persists across lines; `set`, `pushd` and other
   cmd.exe state is per line.
 

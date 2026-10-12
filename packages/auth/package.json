@@ -1,6 +1,6 @@
 {
   "name": "@winlinux/auth",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Basic, NTLM, Kerberos, Negotiate and CredSSP authentication for the winlinux WinRM and SMB2 clients.",
   "keywords": [
     "windows",
@@ -42,15 +42,15 @@
   },
   "dependencies": {
     "des.js": "^1.1.0",
-    "hash-wasm": "^4.12.0",
-    "kerberos": "^7.0.0"
+    "hash-wasm": "^4.12.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "typescript": "~5.7.0"
   },
   "optionalDependencies": {
-    "@winlinux/krb-session-key": "1.0.0"
+    "@winlinux/krb-session-key": "1.1.0",
+    "kerberos": "^7.0.0"
   },
   "publishConfig": {
     "access": "public"

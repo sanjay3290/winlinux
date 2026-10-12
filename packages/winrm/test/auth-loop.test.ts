@@ -328,9 +328,12 @@ describe('transport auth loop', () => {
         return true;
       });
       // One step, then the context is reset. No second step (no NTLM or
-      // other retry) and no request reaches the server.
+      // other retry) and no token reaches the server: the one request is
+      // the unauthenticated TLS probe that precedes a Negotiate first
+      // token.
       assert.deepEqual(events, ['create 0', 'step 0', 'dispose 0', 'create 1']);
-      assert.equal(server.requests.length, 0);
+      assert.equal(server.requests.length, 1);
+      assert.equal(server.requests[0]?.headers.authorization, undefined);
     } finally {
       await transport.close().catch(() => undefined);
       await server.close();

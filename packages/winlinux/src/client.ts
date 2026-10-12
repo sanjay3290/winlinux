@@ -6,7 +6,17 @@ import { access, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promise
 import { X509Certificate, createHash, createPrivateKey, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { checkKeytabFile, type AuthProvider, type AuthTarget, type Credentials, type Mechanism } from '@winlinux/auth';
-import { KERBEROS_INSECURE_REASON, type WinRMConnectOptions, type WinRMSession, type OutputChunk, type EventLogQuery, type InputCommandChunk } from '@winlinux/winrm';
+import {
+  KERBEROS_INSECURE_REASON,
+  type WinRMConnectOptions,
+  type WinRMSession,
+  type OutputChunk,
+  type EventLogQuery,
+  type InputCommandChunk,
+  type PSConnectOptions,
+  type PSInvocationResult,
+  type RunspacePool,
+} from '@winlinux/winrm';
 import {
   SmbAccessDeniedError,
   SmbAlreadyExistsError,
@@ -30,7 +40,7 @@ import {
 import { planAuth, winrmEncrypted } from './plan-auth.js';
 import { redact } from './redact.js';
 import { SESSION_CLOSE_TIMEOUT_MS, Slot } from './slot.js';
-import type { ConnectOptions, Protocol, TransferOptions, TransferVia, WinLinuxClient } from './types.js';
+import type { ConnectOptions, InvokePowerShellOptions, PowerShellOptions, PowerShellSession, Protocol, TransferOptions, TransferVia, WinLinuxClient } from './types.js';
 import { checkPath, checkShare, checkVia, validateConnect, validatePassword } from './validate.js';
 import {
   Base64LineDecoder,
@@ -101,6 +111,8 @@ async function mkdirParents(session: SMBSession, share: string, dirPath: string)
 
 export interface ClientDeps {
   winrmConnect: (opts: WinRMConnectOptions) => Promise<WinRMSession>;
+  // PSRP. Absent: openPowerShell and invokePowerShell are refused.
+  openRunspacePool?: (opts: PSConnectOptions) => Promise<RunspacePool>;
   smbConnect: (opts: SMBConnectOptions) => Promise<SMBSession>;
   createAuthProvider: (mechanism: Mechanism) => AuthProvider;
   // True when Kerberos contexts expose a session key (@winlinux/krb-session-key).
@@ -320,9 +332,10 @@ export function createClient(host: string, options: ConnectOptions, deps: Client
       keyed = (await deps.kerberosSessionKey?.()) ?? false;
       const { winrm: p } = plan();
       if (p.refused) throw new WinLinuxUsageError(p.reason);
-      // Kerberos sends no channel binding yet, so over HTTPS only a
-      // verified certificate ties the ticket to the server. Negotiate
-      // that picks Kerberos is refused by the transport, before its token.
+      // A server that does not enforce channel binding accepts a
+      // Kerberos ticket relayed by a man in the middle, so over HTTPS the
+      // certificate must verify. Negotiate that picks Kerberos is refused
+      // by the transport, before its token.
       if (p.mechanism === 'kerberos' && winrmOpts.tls === true && winrmOpts.tlsVerify === false) {
         throw new WinLinuxUsageError(KERBEROS_INSECURE_REASON);
       }
@@ -400,6 +413,91 @@ export function createClient(host: string, options: ConnectOptions, deps: Client
   let closing: Promise<void> | undefined;
   // Temp files of downloads in flight; close() removes any that are left.
   const partials = new Set<string>();
+
+  // PSRP sessions: each pool has its own connection, opened with the
+  // same plan as the WinRM slot, so -a, --tls, --krb-hostname and the
+  // lockout latch behave the same. close() closes them with the slots.
+  const pools = new Set<RunspacePool>();
+  const openPowerShell = async (opts: PowerShellOptions = {}): Promise<PowerShellSession> => {
+    if (!deps.openRunspacePool) throw new WinLinuxUsageError('PowerShell sessions are not available: the client was built without PSRP support');
+    if (closing) throw new WinLinuxUsageError('client is closed');
+    const latched = winrm.latchedAuthFailure;
+    if (latched) throw latched;
+    keyed = (await deps.kerberosSessionKey?.()) ?? false;
+    const { winrm: p } = plan();
+    if (p.refused) throw new WinLinuxUsageError(p.reason);
+    if (p.mechanism === 'kerberos' && winrmOpts.tls === true && winrmOpts.tlsVerify === false) throw new WinLinuxUsageError(KERBEROS_INSECURE_REASON);
+    await checkKeytab();
+    log(`psrp open ${host}:${winrmPort} (${winrmOpts.tls ? 'https' : 'http'}, mechanism ${p.mechanism}${opts.configurationName ? `, configuration ${opts.configurationName}` : ''})`);
+    const common = {
+      host,
+      port: winrmPort,
+      path: winrmOpts.path,
+      tlsVerify: winrmOpts.tlsVerify ?? true,
+      encryption: winrmOpts.encryption,
+      operationTimeoutMs: winrmOpts.operationTimeoutMs,
+      ...(winrmOpts.connectTimeoutMs !== undefined ? { connectTimeoutMs: winrmOpts.connectTimeoutMs } : {}),
+      ...(opts.configurationName !== undefined ? { configurationName: opts.configurationName } : {}),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    };
+    let pool: RunspacePool;
+    try {
+      pool =
+        p.mechanism === 'certificate'
+          ? await deps.openRunspacePool({ ...common, tls: true, clientCertificate: await readClientCertificate(options, log) })
+          : await deps.openRunspacePool({
+              ...common,
+              tls: winrmOpts.tls ?? false,
+              ...(winrmOpts.credsspAllowHttp !== undefined ? { credsspAllowHttp: winrmOpts.credsspAllowHttp } : {}),
+              ...(p.mechanism === 'credssp' && winrmOpts.onCredSSPDelegation ? { onCredSSPDelegation: winrmOpts.onCredSSPDelegation } : {}),
+              authProvider: authProvider(p.mechanism as Mechanism),
+              credentials: credentials as Credentials,
+            });
+    } catch (err) {
+      // The open runs the handshake (unlike winrm.connect, which opens no
+      // socket), so the mapping is the slot's operation mapping: auth 2,
+      // connection 3, WinRM faults and PSRemotingError as they are. An auth
+      // failure latches on the WinRM slot too.
+      throw winrm.latch(err instanceof WinLinuxUsageError ? err : mapWinrmOpError(err, winrmCtx()));
+    }
+    pools.add(pool);
+    log(`psrp opened, server protocolversion ${pool.serverProtocolVersion}`);
+    const session: PowerShellSession = {
+      host,
+      serverProtocolVersion: pool.serverProtocolVersion,
+      invoke: (script, invokeOpts) => pool.invoke(script, invokeOpts),
+      close: async () => {
+        pools.delete(pool);
+        try {
+          await pool.close();
+        } catch (err) {
+          closeError('psrp')(err);
+        }
+      },
+    };
+    return session;
+  };
+  const invokePowerShell = async (script: string, opts: InvokePowerShellOptions = {}): Promise<PSInvocationResult> => {
+    const session = await openPowerShell(opts);
+    try {
+      return await session.invoke(script, { ...(opts.outString ? { outString: opts.outString } : {}), ...(opts.signal ? { signal: opts.signal } : {}) }).result();
+    } catch (err) {
+      throw mapWinrmOpError(err, winrmCtx());
+    } finally {
+      await session.close();
+    }
+  };
+  const closePools = async (): Promise<void> => {
+    const open = [...pools];
+    pools.clear();
+    if (open.length === 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    const bound = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, deps.closeTimeoutMs ?? SESSION_CLOSE_TIMEOUT_MS);
+    });
+    await Promise.race([Promise.allSettled(open.map((pool) => pool.close().catch(closeError('psrp')))), bound]).finally(() => clearTimeout(timer));
+    log('psrp closed');
+  };
 
   // How get and put travel. `route` caches the auto decision for
   // the client's life; `routing` makes concurrent first calls share one
@@ -558,7 +656,9 @@ export function createClient(host: string, options: ConnectOptions, deps: Client
 
   // get: download into `.<name>.winlinux-<rand>.part` next to the destination,
   // then rename over it. A failed or interrupted transfer leaves the old file.
-  // Errors name localPath, never the temp file.
+  // Errors name localPath, never the temp file. The transfer
+  // signal reaches both routes: WinRM through trackCopy, SMB as the
+  // `{ signal }` of smb2's download, which then rejects with SmbAbortError.
   const download = async (share: string, remotePath: string, localPath: string, opts?: TransferOptions): Promise<void> => {
     const via = await pickRoute(opts?.via);
     const dir = path.dirname(localPath);
@@ -572,7 +672,7 @@ export function createClient(host: string, options: ConnectOptions, deps: Client
         await trackCopy(opts?.signal, (signal) => winrmDownload(share, remotePath, temp, signal)).catch(named);
       } else {
         // Renamed inside use(), so a wrapped WinLinuxConnectionError names it too.
-        await smb.use((s) => s.download(share, remotePath, temp).catch(named));
+        await smb.use((s) => s.download(share, remotePath, temp, opts?.signal ? { signal: opts.signal } : {}).catch(named));
       }
       await rename(temp, localPath).catch(named);
     } finally {
@@ -582,7 +682,9 @@ export function createClient(host: string, options: ConnectOptions, deps: Client
   };
 
   // The file phase of getDir/putDir: the pool, the events, the counters and
-  // the abort rule (no new file after an abort; files in flight finish).
+  // the abort rule: no new file after an abort; a download in flight is
+  // aborted and an upload in flight finishes. Either way the result
+  // is WinLinuxAbortError with the count of files done.
   const copyFiles = async (
     files: Array<{ rel: string; size: number }>,
     parallel: number,
@@ -593,16 +695,23 @@ export function createClient(host: string, options: ConnectOptions, deps: Client
     let done = 0;
     let bytes = 0;
     let started = 0;
-    await runPool(files, parallel, opts.signal, async (file) => {
-      const event: TreeFileEvent = { path: file.rel, index: ++started, total: files.length, sizeBytes: file.size };
-      opts.onFile?.(event);
-      // Await first: `bytes += await x` would read `bytes` before the await
-      // and lose the counts of files that finish in parallel.
-      const copied = await copyOne(file.rel, file.size);
-      bytes += copied;
-      done++;
-      opts.onFileDone?.(event);
-    });
+    try {
+      await runPool(files, parallel, opts.signal, async (file) => {
+        const event: TreeFileEvent = { path: file.rel, index: ++started, total: files.length, sizeBytes: file.size };
+        opts.onFile?.(event);
+        // Await first: `bytes += await x` would read `bytes` before the await
+        // and lose the counts of files that finish in parallel.
+        const copied = await copyOne(file.rel, file.size);
+        bytes += copied;
+        done++;
+        opts.onFileDone?.(event);
+      });
+    } catch (err) {
+      // The file in flight was aborted (SmbAbortError or WinRMAbortError,
+      // both named AbortError): the same outcome as an abort between files.
+      if (opts.signal?.aborted && err instanceof Error && err.name === 'AbortError') throw new WinLinuxAbortError(done, files.length);
+      throw err;
+    }
     if (opts.signal?.aborted && done < files.length) throw new WinLinuxAbortError(done, files.length);
     return { ...base, files: done, bytes };
   };
@@ -614,6 +723,8 @@ export function createClient(host: string, options: ConnectOptions, deps: Client
     runPowerShell: (script) => winrm.use((s) => s.runPowerShell(script)),
     runStream: (cmd, args, opts): AsyncIterable<OutputChunk> => winrm.stream((s) => s.runCommandStream(cmd, args, opts)),
     runPowerShellStream: (script): AsyncIterable<OutputChunk> => winrm.stream((s) => s.runPowerShellStream(script)),
+    openPowerShell,
+    invokePowerShell,
     readEventLog: (query: EventLogQuery) => winrm.use((s) => s.readEventLog(query)),
     listServices: () => winrm.use((s) => s.listServices()),
     listProcesses: () => winrm.use((s) => s.listProcesses()),
@@ -686,7 +797,7 @@ export function createClient(host: string, options: ConnectOptions, deps: Client
       for (const dir of plan.dirs) await mkdir(safeJoin(target, dir.split('/').filter(Boolean)), { recursive: true });
       return copyFiles(plan.files, parallel, opts, { share, remotePath: remoteRoot, localPath: target, directories: plan.dirs.length, skipped: plan.skipped.length }, async (rel) => {
         const local = safeJoin(target, rel.split('/'));
-        await download(share, joinRemote(remoteRoot, rel), local);
+        await download(share, joinRemote(remoteRoot, rel), local, opts.signal ? { signal: opts.signal } : undefined);
         return (await stat(local)).size;
       });
     },
@@ -750,7 +861,7 @@ export function createClient(host: string, options: ConnectOptions, deps: Client
         const copiesDone = inFlight.length === 0 ? Promise.resolve() : Promise.race([Promise.allSettled(inFlight.map((c) => c.done)), bound]);
         closing = copiesDone
           .finally(() => clearTimeout(timer))
-          .then(() => Promise.allSettled([winrm.close(), smb.close()]))
+          .then(() => Promise.allSettled([winrm.close(), smb.close(), closePools()]))
           .then(() => {
           if (opened[0] !== 'idle') log('winrm closed');
           if (opened[1] !== 'idle') log('smb closed');

@@ -1,6 +1,6 @@
 {
   "name": "@winlinux/krb-session-key",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "GSSAPI Kerberos initiator (N-API addon) that exposes the context session key, for SMB2 signing with Kerberos.",
   "keywords": [
     "kerberos",

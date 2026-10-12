@@ -44,6 +44,16 @@ export interface MockOptions {
   setInfoErrors?: Map<string, number>; // file name -> status for any SET_INFO on it
   smb3?: MockSmb3Options; // answer NEGOTIATE with SMB 3.1.1
   interimPending?: boolean; // send an async STATUS_PENDING before every READ result
+  // QUERY_DIRECTORY responses with entries per handle before NO_MORE_FILES
+  // (default 1); from the second page on, names carry a `.p<page>` suffix.
+  dirPages?: number;
+  // Delay, in ms, before the response to the nth request of this command
+  // goes out (nth counts from 1 per command); 0 or undefined sends at once.
+  responseDelayMs?: (type: number, nth: number) => number | undefined;
+  // file name -> the size READ serves after the CREATE reported the full
+  // size: a file that shrank while open; a READ at or past the new
+  // end gets STATUS_END_OF_FILE.
+  shrinkAfterOpen?: Map<string, number>;
   // Rewrites the framed bytes (NetBIOS header + message) of each response,
   // by request command; returns them unchanged to leave a response alone.
   mangle?: (type: number, framed: Buffer) => Buffer;
@@ -248,7 +258,7 @@ export class MockSmbServer {
   connectionsClosed = 0;
   seen: SeenRequest[] = [];
   setupBuffers: Buffer[] = [];
-  creates: Array<{ name: string; disposition: number; options: number }> = [];
+  creates: Array<{ name: string; disposition: number; options: number; desiredAccess: number; shareAccess: number }> = [];
   setInfos: Array<{ name: string; infoClass: number; buffer: Buffer }> = [];
   decryptFailures = 0;
   // SMB 3.1.1 state
@@ -273,6 +283,7 @@ export class MockSmbServer {
   private queryDirCalls = new Map<string, number>();
   private pipeOutbox: Buffer[] = [];
   private files: Map<string, MockFile>;
+  private responsesByType = new Map<number, number>();
 
   constructor(private readonly opts: MockOptions = {}) {
     this.files = new Map(opts.files ?? []);
@@ -419,7 +430,12 @@ export class MockSmbServer {
         if (smb3.tamperEncrypted) wire[wire.length - 1] ^= 0x01;
       }
       const framed = Smb2Packet.prefixMessage(wire);
-      socket.write(this.opts.mangle ? this.opts.mangle(header.type, framed) : framed);
+      const out = this.opts.mangle ? this.opts.mangle(header.type, framed) : framed;
+      const nth = (this.responsesByType.get(header.type) ?? 0) + 1;
+      this.responsesByType.set(header.type, nth);
+      const delay = this.opts.responseDelayMs?.(header.type, nth) ?? 0;
+      if (delay > 0) setTimeout(() => socket.write(out), delay);
+      else socket.write(out);
     };
 
     switch (header.type) {
@@ -503,7 +519,7 @@ export class MockSmbServer {
         const name = (body.buffer as Buffer).toString("ucs2");
         const disposition = body.createDisposition as number;
         const options = body.createOptions as number;
-        this.creates.push({ name, disposition, options });
+        this.creates.push({ name, disposition, options, desiredAccess: body.desiredAccess as number, shareAccess: body.shareAccess as number });
         const forced = this.opts.createErrors?.get(name);
         if (forced !== undefined) {
           respond(forced, {});
@@ -552,7 +568,15 @@ export class MockSmbServer {
           respond(StatusCode.Success, { buffer: this.pipeOutbox.shift() ?? Buffer.alloc(0) });
           return;
         }
-        const data = this.files.get(name)?.data ?? Buffer.alloc(0);
+        let data = this.files.get(name)?.data ?? Buffer.alloc(0);
+        const shrunk = this.opts.shrinkAfterOpen?.get(name);
+        if (shrunk !== undefined) data = data.subarray(0, shrunk);
+        // MS-SMB2 3.3.5.12: a READ at or past the end of the file fails
+        // with STATUS_END_OF_FILE; one that crosses it returns what is left.
+        if (offset >= data.length) {
+          respond(0xc0000011, {});
+          return;
+        }
         respond(StatusCode.Success, { buffer: data.subarray(offset, offset + length) });
         return;
       }
@@ -590,12 +614,13 @@ export class MockSmbServer {
         const calls = (this.queryDirCalls.get(handle) ?? 0) + 1;
         this.queryDirCalls.set(handle, calls);
         this.queryDirCount++;
-        if (calls > 1) {
+        if (calls > (this.opts.dirPages ?? 1)) {
           respond(status("NoMoreFiles"), {});
           return;
         }
         const dirName = this.handles.get(handle) ?? "";
-        const entries = this.opts.dirTree?.get(dirName === "\\root" ? "" : dirName) ?? this.opts.dirEntries ?? [];
+        const page = this.opts.dirTree?.get(dirName === "\\root" ? "" : dirName) ?? this.opts.dirEntries ?? [];
+        const entries = calls === 1 ? page : page.map((entry) => ({ ...entry, name: `${entry.name}.p${calls}` }));
         respond(StatusCode.Success, { buffer: dirEntries(entries) });
         return;
       }

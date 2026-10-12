@@ -5,6 +5,7 @@ import {
   ReceiveAccumulator,
   parseCommandResponse,
   parseCreateShellResponse,
+  parsePsrpReceiveResponse,
   parseReceiveResponse,
   parseSoapFault,
 } from '../src/winrm/parse.js';
@@ -89,5 +90,57 @@ describe('response parsing', () => {
     assert.throws(() => parseCreateShellResponse(faultXml), WinRMFaultError);
     assert.throws(() => parseCommandResponse(faultXml), WinRMFaultError);
     assert.throws(() => parseReceiveResponse(faultXml), WinRMFaultError);
+  });
+});
+
+// A PSRP ReceiveResponse (MS-PSRP 3.1.5.3.8): stdout streams with
+// their CommandId, in order; other names discarded; Done without an
+// ExitCode is fine, where parseReceiveResponse throws.
+describe('parsePsrpReceiveResponse', () => {
+  const RSP = 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell';
+  const PIPELINE = 'FFFFFFFF-0000-4000-8000-000000000001';
+  const b64 = (text: string) => Buffer.from(text).toString('base64');
+  const envelope = (body: string) =>
+    `<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:rsp="${RSP}"><s:Header/><s:Body>${body}</s:Body></s:Envelope>`;
+  const done = `<rsp:CommandState CommandId="${PIPELINE}" State="${RSP}/CommandState/Done"/>`;
+
+  it('stdout only with Done and no ExitCode: done is true, and the WinRS parser refuses the same response', () => {
+    const xml = envelope(`<rsp:ReceiveResponse><rsp:Stream Name="stdout" CommandId="${PIPELINE}">${b64('state')}</rsp:Stream>${done}</rsp:ReceiveResponse>`);
+    const poll = parsePsrpReceiveResponse(xml);
+    assert.equal(poll.done, true);
+    assert.deepEqual(poll.streams.map((s) => [s.commandId, s.data.toString()]), [[PIPELINE, 'state']]);
+    assert.throws(() => parseReceiveResponse(xml), WinRMProtocolError);
+  });
+
+  it('keeps several stdout elements in order with their CommandId, pool streams without one, and drops stderr', () => {
+    const xml = envelope(
+      '<rsp:ReceiveResponse>' +
+        `<rsp:Stream Name="stdout">${b64('pool-1')}</rsp:Stream>` +
+        `<rsp:Stream Name="stderr" CommandId="${PIPELINE}">${b64('ignored')}</rsp:Stream>` +
+        `<rsp:Stream Name="stdout" CommandId="${PIPELINE}">${b64('pipe-1')}</rsp:Stream>` +
+        `<rsp:Stream Name="stdout" CommandId="${PIPELINE}"></rsp:Stream>` +
+        `<rsp:Stream Name="stdout">${b64('pool-2')}</rsp:Stream>` +
+        '</rsp:ReceiveResponse>',
+    );
+    const poll = parsePsrpReceiveResponse(xml);
+    assert.equal(poll.done, false);
+    assert.deepEqual(
+      poll.streams.map((s) => [s.commandId ?? null, s.data.toString()]),
+      [
+        [null, 'pool-1'],
+        [PIPELINE, 'pipe-1'],
+        [null, 'pool-2'],
+      ],
+    );
+  });
+
+  it('a Running state is not done; a response with no streams is empty', () => {
+    const xml = envelope(`<rsp:ReceiveResponse><rsp:CommandState CommandId="${PIPELINE}" State="${RSP}/CommandState/Running"/></rsp:ReceiveResponse>`);
+    assert.deepEqual(parsePsrpReceiveResponse(xml), { streams: [], done: false });
+  });
+
+  it('a fault throws WinRMFaultError, and a body without ReceiveResponse throws WinRMProtocolError', () => {
+    assert.throws(() => parsePsrpReceiveResponse(fixture('fault-500.xml')), WinRMFaultError);
+    assert.throws(() => parsePsrpReceiveResponse(envelope('<rsp:Nothing/>')), WinRMProtocolError);
   });
 });

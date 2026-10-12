@@ -277,6 +277,10 @@ export function buildAcceptorHarness(dir: string): Promise<string> {
 export interface AcceptStep {
   token: Buffer | null;
   complete: boolean;
+  // GSS_C_CHANNEL_BOUND_FLAG from the acceptor: the initiator's channel
+  // bindings matched the acceptor's. Null when the library has no
+  // such flag (MIT krb5 before 1.19).
+  bound: boolean | null;
 }
 
 // One GSS acceptor process (one security context), driven over stdio.
@@ -311,11 +315,20 @@ export class Acceptor {
     return this.readLine();
   }
 
-  async accept(token: Buffer): Promise<AcceptStep> {
-    const [kind, value] = await this.send(`accept ${token.toString('base64')}`);
+  // channelBindings: the application_data the acceptor expects (no
+  // addresses), for example the tls-server-end-point binding of its own
+  // certificate; the acceptor refuses an initiator whose bindings differ.
+  async accept(token: Buffer, channelBindings?: Buffer): Promise<AcceptStep> {
+    const cb = channelBindings ? ` ${channelBindings.toString('base64')}` : '';
+    const [kind, value] = await this.send(`accept ${token.toString('base64')}${cb}`);
     if (kind !== 'token') throw new Error(`acceptor: unexpected reply ${kind}`);
     const [, done] = await this.readLine();
-    return { token: value === '-' ? null : Buffer.from(value ?? '', 'base64'), complete: done === '1' };
+    const [, bound] = await this.readLine();
+    return {
+      token: value === '-' ? null : Buffer.from(value ?? '', 'base64'),
+      complete: done === '1',
+      bound: bound === '-' ? null : bound === '1',
+    };
   }
 
   async unwrapIov(header: Buffer, data: Buffer): Promise<Buffer> {

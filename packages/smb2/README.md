@@ -24,6 +24,11 @@ try {
   console.log(await smb.listShares());
   console.log(await smb.list('C$', 'Windows/Temp'));
   await smb.download('C$', 'Windows/Temp/report.csv', './report.csv');
+  const tail = await smb.readRange('C$', 'inetpub/logs/LogFiles/W3SVC1/u_ex261011.log', 400 * 1024 * 1024, 1024 * 1024);
+  const signal = AbortSignal.timeout(5000); // or an AbortController's signal
+  for await (const entry of smb.listIter('C$', 'Windows/System32', { signal })) {
+    if (entry.name.endsWith('.dll')) break;  // stops the listing and closes the handle
+  }
 } finally {
   await smb.close();
 }
@@ -35,6 +40,24 @@ try {
   AES-128-CCM, when the server or a share requires it.
 - Kerberos signing needs the session key from the optional
   `@winlinux/krb-session-key` addon.
+- `AbortSignal`, and connect and request timeouts. `list`, `listIter`,
+  `stat`, `readFile` and `download` take `{ signal }` as their last
+  argument. On abort the call sends no further request, the request in
+  flight rejects at once, the file or directory handle closes, and the call
+  rejects with `SmbAbortError`, whose `name` is `'AbortError'`; the session
+  stays usable. A signal that is already aborted rejects before any request
+  goes out.
+- A `download` that fails or is aborted removes the partial file at its
+  local path before it rejects, so no truncated file stays behind.
+- `listIter(share, dir)` yields entries as each `QUERY_DIRECTORY` response
+  arrives, so a caller with a time budget can stop early: `break` closes
+  the directory handle.
+- `readRange(share, path, offset, length)` returns the bytes
+  `[offset, offset + length)` of a file of any size, for example the tail
+  of a large log: the file opens read-only with share access read, write
+  and delete, so a file another process holds open for append reads too.
+  Fewer bytes come back at end of file, an empty `Buffer` past it; `length`
+  above `MAX_BUFFERED_FILE_BYTES` (64 MiB) is refused.
 - No runtime dependencies. The package has no NTLM code of its own: an
   `AuthProvider` (from `@winlinux/auth` or your own) does the sign-in.
 

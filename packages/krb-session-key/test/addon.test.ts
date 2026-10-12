@@ -69,6 +69,32 @@ describe('krb-session-key: native library loading', () => {
 });
 
 describe('krb-session-key: context lifecycle without a KDC', () => {
+  // The default credential (no ccache, no principal) is acquired at the
+  // first step, so create() alone needs no KDC.
+  it('create() records channel bindings: channelBound is true only for a non-empty Buffer', async () => {
+    const binding = Buffer.from('tls-server-end-point:0123456789abcdef0123456789abcdef', 'ascii');
+    const bound = await KrbClient.create('HTTP@server.example', { channelBindings: binding });
+    assert.equal(bound.channelBound, true);
+    bound.dispose();
+    const plain = await KrbClient.create('HTTP@server.example');
+    assert.equal(plain.channelBound, false);
+    plain.dispose();
+    const empty = await KrbClient.create('HTTP@server.example', { channelBindings: Buffer.alloc(0) });
+    assert.equal(empty.channelBound, false);
+    empty.dispose();
+  });
+
+  it('create() rejects channel bindings that are not a Buffer with a TypeError', async () => {
+    await assert.rejects(
+      () => KrbClient.create('HTTP@server.example', { channelBindings: 'tls-server-end-point:x' as unknown as Buffer }),
+      TypeError,
+    );
+    await assert.rejects(
+      () => KrbClient.create('HTTP@server.example', { channelBindings: 42 as unknown as Buffer }),
+      TypeError,
+    );
+  });
+
   it('create() rejects a non-string service name with a TypeError', async () => {
     await assert.rejects(
       () => (KrbClient as unknown as { create: (s: unknown) => Promise<unknown> }).create(42),

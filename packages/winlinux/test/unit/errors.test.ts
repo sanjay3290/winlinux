@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  WinRMAbortError,
   WinRMAuthError,
   WinRMError,
   WinRMFaultError,
@@ -8,6 +9,7 @@ import {
   WinRMTransportError,
 } from '@winlinux/winrm';
 import {
+  SmbAbortError,
   SmbAccessDeniedError,
   SmbAuthError,
   SmbConnectionError,
@@ -176,6 +178,8 @@ describe('error mapping', () => {
     assert.equal(exitCodeFor(new WinLinuxConnectionError('c', 'winrm', 'h', 1)), EXIT.connection);
     assert.equal(exitCodeFor(new WinRMFaultError('f', null, null, 'r', null, null, '')), EXIT.remote);
     assert.equal(exitCodeFor(new WinRMProtocolError('p')), EXIT.remote);
+    assert.equal(exitCodeFor(new WinRMAbortError()), EXIT.interrupted);
+    assert.equal(exitCodeFor(new SmbAbortError('download s/f to x was aborted')), EXIT.interrupted);
     assert.equal(exitCodeFor(new WinRMError('e')), EXIT.remote);
     assert.equal(exitCodeFor(new SmbNotFoundError('n')), EXIT.file);
     assert.equal(exitCodeFor(new SmbFileTooLargeError('t')), EXIT.file);

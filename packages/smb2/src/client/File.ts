@@ -11,9 +11,13 @@ import FilePipePrinterAccess from "../protocol/smb2/FilePipePrinterAccess.js";
 import { FileInfoClass, InfoType } from "../protocol/smb2/packets/SetInfo.js";
 import { Readable } from "stream";
 import { FileWriteStream } from "./stream/FileWriteStream.js";
+import { throwIfAborted } from "../errors.js";
+import type { ReadOptions } from "./Directory.js";
 
 const maxReadChunkLength = 0x00010000;
 const maxWriteChunkLength = 0x00010000 - 0x71;
+// MS-SMB2 3.3.5.12: a READ at or past the end of the file.
+const STATUS_END_OF_FILE = 0xc0000011;
 
 interface OpenOptions {
   desiredAccess?: FilePipePrinterAccess;
@@ -141,47 +145,80 @@ class File extends EventEmitter {
     return new FileWriteStream(maxWriteChunkLength, this.writeChunk.bind(this));
   }
 
-  private async readChunk(initial: number, offset: number) {
-    const fileSize = Number(this.fileSize);
-    const nextOffset = (initial + 1) * maxReadChunkLength;
-    const length = nextOffset > fileSize ? fileSize - offset : nextOffset - offset;
-
+  // One READ of `length` bytes at `offset`. The signal is checked
+  // before the request goes out, and the request in flight rejects at
+  // once when it fires.
+  private async readAt(offset: bigint, length: number, signal?: AbortSignal) {
+    throwIfAborted(signal, `READ of ${this._id.toString("hex")} at ${offset}`);
     const lengthBuffer = Buffer.alloc(4);
     lengthBuffer.writeInt32LE(length, 0);
 
     const offsetBuffer = Buffer.alloc(8);
-    offsetBuffer.writeBigUInt64LE(BigInt(offset));
+    offsetBuffer.writeBigUInt64LE(offset);
 
     const response = await this.tree.request({ type: PacketType.Read, creditCharge: Math.max(1, Math.ceil(length / 65536)) }, {
       fileId: this._id,
       length: lengthBuffer,
       offset: offsetBuffer
-    });
+    }, { signal });
 
     return response.body.buffer as Buffer;
   }
 
-  async read() {
+  private readChunk(initial: number, offset: number, signal?: AbortSignal) {
+    const fileSize = Number(this.fileSize);
+    const nextOffset = (initial + 1) * maxReadChunkLength;
+    const length = nextOffset > fileSize ? fileSize - offset : nextOffset - offset;
+    return this.readAt(BigInt(offset), length, signal);
+  }
+
+  // The bytes [offset, offset + length) in READs of at most
+  // maxReadChunkLength, within the size the CREATE reported. Fewer
+  // bytes come back at end of file and none past it; a file that shrank
+  // since the CREATE (STATUS_END_OF_FILE on a READ) ends the range too.
+  async readRange(offset: bigint, length: number, options: ReadOptions = {}): Promise<Buffer> {
+    const wanted = offset + BigInt(length);
+    const end = wanted > this.fileSize ? this.fileSize : wanted;
+    if (end <= offset) return Buffer.alloc(0);
+    const total = Number(end - offset);
+    const buffer = Buffer.alloc(total);
+    let done = 0;
+    while (done < total) {
+      let data: Buffer;
+      try {
+        data = await this.readAt(offset + BigInt(done), Math.min(maxReadChunkLength, total - done), options.signal);
+      } catch (error) {
+        if ((error as { header?: { status?: unknown } })?.header?.status === STATUS_END_OF_FILE) break;
+        throw error;
+      }
+      if (data.length === 0) break;
+      data.copy(buffer, done);
+      done += data.length;
+    }
+    return done === total ? buffer : buffer.subarray(0, done);
+  }
+
+  async read(options: ReadOptions = {}) {
     const fileSize = Number(this.fileSize);
     const chunkCount = Math.ceil(fileSize / maxReadChunkLength);
 
     const buffer = Buffer.alloc(fileSize);
     for (let index = 0; index < chunkCount; index++) {
       const offset = index * maxReadChunkLength;
-      ((await this.readChunk(index, offset)) as Buffer).copy(buffer, offset);
+      ((await this.readChunk(index, offset, options.signal)) as Buffer).copy(buffer, offset);
     }
 
     return buffer;
   }
 
-  createReadStream() {
+  createReadStream(options: ReadOptions = {}) {
     const fileSize = Number(this.fileSize);
     return Readable.from(async function* read() {
       const chunkCount = Math.ceil(fileSize / maxReadChunkLength);
 
       for (let index = 0; index < chunkCount; index++) {
         const offset = index * maxReadChunkLength;
-        yield ((await this.readChunk(index, offset)) as Buffer);
+        yield ((await this.readChunk(index, offset, options.signal)) as Buffer);
       }
     }.bind(this)());
   }

@@ -5,6 +5,7 @@ import { isIP } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AuthProvider, AuthTarget, Credentials, SecurityContext, StepResult } from './types.js';
+import type { ChannelBoundTarget } from './channel-bindings.js';
 import type { WinRMMessageProtection, WinRMSealed } from './winrm-extension.js';
 import {
   NegState,
@@ -20,6 +21,10 @@ import {
 // `kerberos` package. The optional members exist only on the addon.
 export interface GssClient {
   readonly contextComplete: boolean;
+  // True when the GSS layer holds the channel bindings of GssInit and puts
+  // them into every token. Undefined with the `kerberos` package,
+  // which takes no bindings and sends none.
+  readonly channelBound?: boolean;
   step(challenge: string): Promise<string>;
   wrap(data: string, options?: { protect?: boolean }): Promise<string>;
   unwrap(challenge: string): Promise<string>;
@@ -40,6 +45,14 @@ export interface GssInit {
   // Credential cache for this context only (for example FILE:/tmp/x/ccache).
   // Absent: the GSS library default (KRB5CCNAME or the system default).
   ccache?: string;
+  // Channel bindings: the application_data of a GSS channel-binding
+  // structure with no addresses, the target's `channelBindings`
+  // (channel-bindings.ts), for example the RFC 5929 tls-server-end-point
+  // binding of the TLS server certificate. The AP-REQ then carries the MD5
+  // of the packed structure in its authenticator checksum (RFC 4121
+  // 4.1.1.2), which a server that enforces channel binding compares with
+  // its own certificate.
+  channelBindings?: Buffer;
 }
 
 export type GssFactory = (service: string, init: GssInit) => Promise<GssClient>;
@@ -81,38 +94,101 @@ export async function withCcacheEnv<T>(ccache: string, fn: () => Promise<T>): Pr
   }
 }
 
-export const kerberosPackageGssFactory: GssFactory = async (service, init) => {
-  const krb = await import('kerberos');
-  const create = () =>
-    krb.initializeClient(service, {
-      principal: init.principal,
-      // eslint-disable-next-line no-bitwise
-      gssFlag:
-        krb.GSS_C_MUTUAL_FLAG |
-        krb.GSS_C_REPLAY_FLAG |
-        krb.GSS_C_SEQUENCE_FLAG |
-        krb.GSS_C_CONF_FLAG |
-        krb.GSS_C_INTEG_FLAG,
-      // Raw KRB5 tokens; SPNEGO framing stays in this module (design risk R1).
-      mechOID: krb.GSS_MECH_OID_KRB5,
-    });
-  const { ccache } = init;
-  if (!ccache) return create();
-  const client = await withCcacheEnv(ccache, create);
-  let first = true;
-  return {
-    get contextComplete() {
-      return client.contextComplete;
-    },
-    step(challenge: string) {
-      if (!first) return client.step(challenge);
-      first = false;
-      return withCcacheEnv(ccache, () => client.step(challenge));
-    },
-    wrap: (data, options) => client.wrap(data, options),
-    unwrap: (challenge) => client.unwrap(challenge),
+// The `kerberos` package is an optional dependency of @winlinux/auth
+//: only this import loads it, so an NTLM-only or Basic-only consumer
+// can install with `npm install --omit=optional` and skip its native build.
+// A missing package raises Node's ERR_MODULE_NOT_FOUND (MODULE_NOT_FOUND
+// from a CommonJS require), which becomes the install hint below. A package
+// that is installed but cannot load its binding (the build failed, or the
+// GSSAPI run-time library is missing) raises its own error, which passes
+// through with a hint for the library case.
+export const KERBEROS_PACKAGE_NOT_INSTALLED =
+  'the kerberos package is not installed: run `npm install kerberos` ' +
+  '(an optional dependency of @winlinux/auth; NTLM and Basic work without it), ' +
+  'or install @winlinux/krb-session-key';
+export const GSSAPI_LIBRARY_HINT =
+  'install the MIT Kerberos run-time library: libgssapi-krb5-2 (Debian/Ubuntu), krb5-libs (Fedora/RHEL/Alpine)';
+
+// The part of the `kerberos` package this module uses. Declared here, like
+// KrbSessionKeyModule, so the emitted declarations never name the optional
+// package: a consumer without it still type-checks against @winlinux/auth.
+export interface KerberosPackageClient {
+  contextComplete: boolean;
+  step(challenge: string): Promise<string>;
+  wrap(challenge: string, options?: { protect?: boolean }): Promise<string>;
+  unwrap(challenge: string): Promise<string>;
+}
+export interface KerberosPackage {
+  GSS_C_MUTUAL_FLAG: number;
+  GSS_C_REPLAY_FLAG: number;
+  GSS_C_SEQUENCE_FLAG: number;
+  GSS_C_CONF_FLAG: number;
+  GSS_C_INTEG_FLAG: number;
+  GSS_MECH_OID_KRB5: number;
+  initializeClient(service: string, options?: { principal?: string; gssFlag?: number; mechOID?: number }): Promise<KerberosPackageClient>;
+}
+export type KerberosImporter = () => Promise<KerberosPackage>;
+
+export function isKerberosPackageMissing(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code !== 'ERR_MODULE_NOT_FOUND' && code !== 'MODULE_NOT_FOUND') return false;
+  return /Cannot find (?:package|module) 'kerberos'/.test((err as Error).message ?? '');
+}
+
+export function kerberosPackageLoadError(err: unknown): Error {
+  if (isKerberosPackageMissing(err)) return new Error(KERBEROS_PACKAGE_NOT_INSTALLED);
+  if (err instanceof Error && /libgssapi_krb5/.test(err.message)) {
+    return new Error(`${err.message}; ${GSSAPI_LIBRARY_HINT}`, { cause: err });
+  }
+  return err instanceof Error ? err : new Error(String(err));
+}
+
+// Builds the `kerberos` package factory on an importer, so tests can stand
+// in for the package without uninstalling it. The package has no channel
+// binding parameter, so a context on it sends none: over TLS, only
+// the verified server certificate ties its AP-REQ to the server. The
+// context reports this as channelBound false.
+export function createKerberosPackageGssFactory(importKerberos: KerberosImporter = () => import('kerberos')): GssFactory {
+  return async (service, init) => {
+    let krb: KerberosPackage;
+    try {
+      krb = await importKerberos();
+    } catch (err) {
+      throw kerberosPackageLoadError(err);
+    }
+    const create = () =>
+      krb.initializeClient(service, {
+        principal: init.principal,
+        // eslint-disable-next-line no-bitwise
+        gssFlag:
+          krb.GSS_C_MUTUAL_FLAG |
+          krb.GSS_C_REPLAY_FLAG |
+          krb.GSS_C_SEQUENCE_FLAG |
+          krb.GSS_C_CONF_FLAG |
+          krb.GSS_C_INTEG_FLAG,
+        // Raw KRB5 tokens; SPNEGO framing stays in this module (design risk R1).
+        mechOID: krb.GSS_MECH_OID_KRB5,
+      });
+    const { ccache } = init;
+    if (!ccache) return create();
+    const client = await withCcacheEnv(ccache, create);
+    let first = true;
+    return {
+      get contextComplete() {
+        return client.contextComplete;
+      },
+      step(challenge: string) {
+        if (!first) return client.step(challenge);
+        first = false;
+        return withCcacheEnv(ccache, () => client.step(challenge));
+      },
+      wrap: (data, options) => client.wrap(data, options),
+      unwrap: (challenge) => client.unwrap(challenge),
+    };
   };
-};
+}
+
+export const kerberosPackageGssFactory: GssFactory = createKerberosPackageGssFactory();
 
 let addonModule: Promise<KrbSessionKeyModule | null> | null = null;
 let addonError: string | undefined;
@@ -306,6 +382,14 @@ export class KerberosSecurityContext implements SecurityContext, WinRMMessagePro
     return this.key ? Buffer.from(this.key) : undefined;
   }
 
+  // True once the GSS layer holds the target's channel binding, so the
+  // tokens are bound to the TLS server certificate: the addon with
+  // target.channelBindings set before the first step. False without a
+  // binding, before the first step, and with the `kerberos` package.
+  get channelBound(): boolean {
+    return this.gss?.channelBound === true;
+  }
+
   private async ensureGss(): Promise<GssClient> {
     if (this.gss) return this.gss;
     const hostError = kerberosHostError(this.target);
@@ -327,10 +411,15 @@ export class KerberosSecurityContext implements SecurityContext, WinRMMessagePro
       else await run([principal], password, env);
     }
     const factory = this.deps.gss ?? defaultGssFactory;
+    // The binding the consumer set on the target before this first step
+    // (channel-bindings.ts): the WinRM transport learns its TLS server
+    // certificate before it asks for the first token.
+    const bindings = (this.target as ChannelBoundTarget).channelBindings;
     try {
       this.gss = await factory(servicePrincipal(this.target), {
         principal: clientPrincipal(this.credentials),
         ...(ccache ? { ccache } : {}),
+        ...(bindings && bindings.length > 0 ? { channelBindings: Buffer.from(bindings) } : {}),
       });
     } catch (err) {
       throw new Error(`Kerberos init failed: ${(err as Error).message}`);

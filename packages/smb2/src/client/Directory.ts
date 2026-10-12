@@ -13,6 +13,13 @@ import DirectoryEntry from "../protocol/models/DirectoryEntry.js";
 import { InfoType, FileInfoClass } from "../protocol/smb2/packets/SetInfo.js";
 import CreateDispositionType from "../protocol/smb2/CreateDispositionType.js";
 import { Flags as ChangeNotifyFlags } from "../protocol/smb2/packets/ChangeNotify.js";
+import { throwIfAborted } from "../errors.js";
+
+// An AbortSignal for a read: checked before each request, and the
+// request in flight rejects at once when it fires.
+export interface ReadOptions {
+  signal?: AbortSignal;
+}
 
 interface OpenOptions {
   desiredAccess?: DirectoryAccess;
@@ -144,24 +151,33 @@ class Directory extends EventEmitter {
 
   // Reads the whole directory: each QUERY_DIRECTORY call continues the
   // enumeration on the open handle until the server answers NO_MORE_FILES.
-  async read() {
+  async read(options: ReadOptions = {}) {
     const entries: DirectoryEntry[] = [];
+    for await (const page of this.pages(options)) entries.push(...page);
+    return entries;
+  }
+
+  // One array per QUERY_DIRECTORY response, in server order, without "."
+  // and "..", so a caller can stop after any page. On abort no
+  // further request goes out and the iterator rejects with SmbAbortError;
+  // closing the handle is the caller's job (Tree.readDirectoryPages).
+  async *pages(options: ReadOptions = {}): AsyncGenerator<DirectoryEntry[], void, undefined> {
+    const { signal } = options;
     for (;;) {
+      throwIfAborted(signal, `QUERY_DIRECTORY of ${this._id}`);
       let response;
       try {
         response = await this.tree.request({ type: PacketType.QueryDirectory }, {
           fileId: this._id,
           buffer: Buffer.from("*", "ucs2")
-        });
+        }, { signal });
       } catch (error) {
-        if ((error as { header?: { status?: unknown } })?.header?.status === StatusCode.NoMoreFiles) break;
+        if ((error as { header?: { status?: unknown } })?.header?.status === StatusCode.NoMoreFiles) return;
         throw error;
       }
-      if (!response.data) break;
-      entries.push(...response.data.filter(x => x.filename !== "." && x.filename !== ".."));
+      if (!response.data) return;
+      yield response.data.filter(x => x.filename !== "." && x.filename !== "..");
     }
-
-    return entries;
   }
 
   async exists(path: string) {

@@ -3,7 +3,46 @@ import { WinRMSessionImpl } from './session.js';
 
 export type { AuthProvider, Credentials, AuthTarget, Mechanism, SecurityContext, StepResult } from '../auth-provider.js';
 export { MAX_ENVELOPE_SIZE, SEND_CHUNK_BYTES } from './envelopes.js';
-export { WinRMError, WinRMAuthError, WinRMTransportError, WinRMFaultError, WinRMProtocolError, WinRMAbortError } from './errors.js';
+export { WinRMError, WinRMAuthError, WinRMTransportError, WinRMFaultError, WinRMProtocolError, WinRMAbortError, PSRemotingError } from './errors.js';
+// PSRP message and fragment codec (MS-PSRP 2.2.1 and 2.2.4).
+export {
+  Defragmenter,
+  Destination,
+  EMPTY_GUID,
+  MAX_FRAGMENT_BLOB_BYTES,
+  MAX_MESSAGE_BYTES,
+  MAX_PARTIAL_MESSAGES,
+  MessageType,
+  decodeFragments,
+  decodeMessage,
+  encodeFragments,
+  encodeMessage,
+  messageTypeName,
+} from './psrp/index.js';
+export type { Fragment, PsrpMessage } from './psrp/index.js';
+// CLIXML serializer and deserializer subset (MS-PSRP 2.2.5).
+export {
+  deserializeClixml,
+  isPSObject,
+  psDateTime,
+  psEnum,
+  psGuid,
+  psObject,
+  psScriptBlock,
+  psUri,
+  psVersion,
+  psXml,
+  serializeClixml,
+  toErrorRecord,
+  toInformationRecord,
+  toInformationalMessage,
+  toJson,
+  toProgressRecord,
+} from './psrp/index.js';
+export type { PSDateTime, PSDictionary, PSDuration, PSErrorRecord, PSInformationRecord, PSObject, PSObjectKind, PSProgressRecord, PSSecureString, PSValue } from './psrp/index.js';
+// PSRP runspace pool and pipeline (MS-PSRP 3.1.4).
+export { MIN_SERVER_PROTOCOL_VERSION, openRunspacePool } from './psrp/index.js';
+export type { InvokeOptions, PSCommand, PSConnectOptions, PSInvocationResult, PSInvocationState, PSPipeline, PSStreamEvent, PsrpTraceEvent, RunspacePool, RunspacePoolState } from './psrp/index.js';
 export { CREDSSP_HTTP_REASON, CREDSSP_INSECURE_REASON, KERBEROS_INSECURE_REASON } from './transport.js';
 export { psQuote } from './powershell.js';
 

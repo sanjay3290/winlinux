@@ -59,6 +59,12 @@ export class NegotiateSecurityContext implements SecurityContext, WinRMMessagePr
     return this.inner?.sessionKey;
   }
 
+  // The Kerberos leg's channel binding state; NTLM binds through
+  // its own AV pair and reports nothing here.
+  get channelBound(): boolean {
+    return (this.inner as { channelBound?: boolean } | null)?.channelBound === true;
+  }
+
   // The WinRM extension of the mechanism that won (Kerberos offers it with
   // the addon; NTLM never does, WinRM uses its wrap() instead).
   get wrapWinRM(): ((plaintext: Buffer) => Promise<WinRMSealed>) | undefined {
@@ -75,12 +81,15 @@ export class NegotiateSecurityContext implements SecurityContext, WinRMMessagePr
     return ctx;
   }
 
-  // A keytab has no password, so NTLM cannot run: a Kerberos
-  // failure is final.
+  // A keytab has no password, and neither has the ticket cache on
+  // its own, so NTLM cannot run: the Kerberos failure is final, and the
+  // caller sees it rather than "NTLM needs a password". With a password,
+  // NTLM takes over; that includes a missing `kerberos` package, which is
+  // an optional dependency.
   private fallBackToNtlm(kerberosError?: unknown): NtlmSecurityContext {
-    if (this.credentials.keytab !== undefined) {
+    if (this.credentials.keytab !== undefined || this.credentials.password === undefined) {
       if (kerberosError instanceof Error) throw kerberosError;
-      throw new Error('a keytab works with Kerberos only');
+      throw new Error(this.credentials.keytab !== undefined ? 'a keytab works with Kerberos only' : 'Negotiate needs a password for NTLM');
     }
     const prev = this.inner;
     const ctx = new NtlmSecurityContext(this.target, this.credentials);

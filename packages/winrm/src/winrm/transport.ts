@@ -99,12 +99,15 @@ const MAX_CREDSSP_HANDSHAKE_ROUNDS = 10;
 export const CREDSSP_INSECURE_REASON =
   'CredSSP refuses --insecure (tlsVerify false): CredSSP delegates your password to the server, ' +
   "so the server's TLS certificate must be verified";
-// Kerberos sends no channel binding yet: over TLS only a verified
-// certificate ties the AP-REQ to the real server, so a man in the middle
-// with any certificate could pass the ticket on.
+// Kerberos over TLS: the AP-REQ carries the tls-server-end-point
+// binding of the server certificate (with @winlinux/krb-session-key; the
+// `kerberos` package sends none), but only a server that enforces channel
+// binding (WinRM CbtHardeningLevel Strict, not the default Relaxed) checks
+// it. With tlsVerify false a man in the middle with any certificate could
+// pass the ticket on to any other server, so the certificate must verify.
 export const KERBEROS_INSECURE_REASON =
-  'Kerberos refuses --insecure (tlsVerify false) over HTTPS: this client sends no Kerberos channel binding yet, so ' +
-  "only the server's verified TLS certificate ties the ticket to the real server. Drop --insecure, or use another sign-in method";
+  'Kerberos refuses --insecure (tlsVerify false) over HTTPS: a server that does not enforce channel binding accepts a ' +
+  "Kerberos ticket relayed by a man in the middle, so the server's TLS certificate must be verified. Drop --insecure, or use another sign-in method";
 export const CREDSSP_HTTP_REASON =
   'CredSSP over plain HTTP is refused: the outer HTTP channel has no certificate check, and CredSSP ' +
   'delegates your password to the server. Use --tls (HTTPS, port 5986), or pass --credssp-allow-http to accept the risk';
@@ -151,7 +154,9 @@ export class WinRMTransport {
   // The target every context gets. Over TLS the transport sets its
   // channelBindings (RFC 5929 tls-server-end-point, channel-binding.ts)
   // once a socket exists and before it feeds the first server challenge,
-  // so the NTLM AUTHENTICATE binds to this connection.
+  // so the NTLM AUTHENTICATE binds to this connection. Kerberos binds
+  // its first token, so for it the socket is opened by a probe before the
+  // first step (handshake()).
   private readonly target: ChannelBoundTarget;
   private ctx: SecurityContext;
   // True once a handshake got a non-401 answer: the connection (pinned
@@ -163,6 +168,10 @@ export class WinRMTransport {
   // handshake and answers a stale AUTHENTICATE token with 401, so no
   // header is sent until the server asks again.
   private repeatHeader: string | null = null;
+  // The DER certificate of the socket the unauthenticated probe bound
+  //: set by the probe, cleared once the first token's answer has
+  // been checked against it, and by resetContext().
+  private probeCertificate: Buffer | null = null;
   private readonly encrypted: boolean;
   private readonly certificate: boolean;
 
@@ -225,6 +234,12 @@ export class WinRMTransport {
       this.agent = new https.Agent({
         ...agentOpts,
         rejectUnauthorized: opts.tlsVerify,
+        // No TLS session resumption: on a resumed session Node
+        // reports no peer certificate, so a new socket after a drop would
+        // get no channel binding and could not be checked against
+        // the probe's certificate. A full handshake on each new socket
+        // costs one round trip, and the keep-alive agent opens few.
+        maxCachedSessions: 0,
         // Certificate sign-in is capped at TLS 1.2. HTTP.sys asks for
         // the client certificate after the handshake unless the SSL binding
         // has clientcertnegotiation=enable. In TLS 1.2 that is a
@@ -269,7 +284,11 @@ export class WinRMTransport {
     return encryptedContentType(protocolFor(mechanism), isMultiPart(mechanism, length));
   }
 
-  private requestOnce(body: Buffer, headers: Record<string, string>, signal?: AbortSignal): Promise<RawResponse> {
+  // expectCertificate: nothing is written, not even the headers,
+  // until the socket's TLS handshake is done and its server certificate is
+  // that one (DER). On any other certificate the request is destroyed with
+  // a WinRMAuthError, so the bytes never reach that peer.
+  private requestOnce(body: Buffer, headers: Record<string, string>, signal?: AbortSignal, expectCertificate?: Buffer): Promise<RawResponse> {
     const { host, port, path, tlsVerify, tls, requestTimeoutMs } = this.opts;
     return new Promise<RawResponse>((resolve, reject) => {
       const req = this.httpModule.request(
@@ -347,8 +366,25 @@ export class WinRMTransport {
         err.code = 'ETIMEDOUT';
         req.destroy(err);
       });
-      if (body.length > 0) req.write(body);
-      req.end();
+      const send = () => {
+        if (body.length > 0) req.write(body);
+        req.end();
+      };
+      if (!expectCertificate) {
+        send();
+        return;
+      }
+      req.once('socket', (socket) => {
+        const tlsSocket = socket as Partial<TLSSocket>;
+        const check = () => {
+          const raw = tlsSocket.getPeerCertificate?.()?.raw;
+          if (raw && raw.length > 0 && raw.equals(expectCertificate)) send();
+          else req.destroy(this.wrongSocketError());
+        };
+        // A reused keep-alive socket finished its handshake long ago.
+        if (req.reusedSocket || tlsSocket.getPeerCertificate?.()?.raw?.length) check();
+        else socket.once('secureConnect', check);
+      });
     });
   }
 
@@ -364,7 +400,7 @@ export class WinRMTransport {
   // before any wrap().
   private checkEncryptionMechanism(): void {
     // Negotiate picks Kerberos at run time; refuse it over unverified TLS
-    // before its first token leaves.
+    // before its first token leaves (KERBEROS_INSECURE_REASON).
     if (this.opts.tls && !this.opts.tlsVerify && this.mechanism() === 'kerberos') {
       throw new WinRMTransportError(KERBEROS_INSECURE_REASON);
     }
@@ -423,14 +459,55 @@ export class WinRMTransport {
 
   // Binds the handshake to the TLS connection that answered: the target
   // carries the tls-server-end-point application data of its certificate
-  // from now on (the provider reads it when it builds the AUTHENTICATE).
-  // Over plain HTTP there is no certificate and no binding.
+  // from now on (NTLM reads it when it builds the AUTHENTICATE, Kerberos
+  // when it builds the AP-REQ). Over plain HTTP there is no certificate
+  // and no binding.
   private bindChannel(res: RawResponse): void {
     if (res.peerCertificate) this.target.channelBindings = tlsServerEndPoint(res.peerCertificate);
   }
 
+  // Kerberos carries its channel binding in its first token, the AP-REQ,
+  // which Negotiate may send too. NTLM binds its AUTHENTICATE, the second
+  // token, by which time a socket exists; Basic, CredSSP and a certificate
+  // bind nothing.
+  private bindsFirstToken(): boolean {
+    const mechanism = this.providerMechanism();
+    return mechanism === 'kerberos' || mechanism === 'negotiate';
+  }
+
+  // The first token carries the binding of the probe's certificate, so it
+  // must travel on a connection to that certificate. The keep-alive
+  // agent reuses the probe's socket, but a proxy or load balancer that
+  // closes the connection after the probe's 401 moves the token to a new
+  // socket. requestOnce checks that socket's certificate after the TLS
+  // handshake and before it writes anything: a different certificate fails
+  // the sign-in and the token never goes out. That is refused, never
+  // retried: with per-backend certificates the server would fail the binding
+  // anyway (CbtHardeningLevel Strict), and a second connection with another
+  // certificate could be an attacker's. The same certificate on a new socket
+  // is fine: the binding still matches the peer that gets the token.
+  private wrongSocketError(): WinRMAuthError {
+    return new WinRMAuthError(
+      `WinRM ${this.scheme()} sign-in failed: the first token would go out on a new TLS connection whose server ` +
+        'certificate differs from the one the channel binding was computed from (a proxy or load balancer closed ' +
+        'the connection after the probe). The token was not sent, and the sign-in is not retried.',
+    );
+  }
+
   // Runs the auth loop and returns the first non-401 response.
   private async handshake(body: () => Promise<Buffer>, contentType: string, signal?: AbortSignal): Promise<RawResponse> {
+    // Over TLS, Kerberos needs the server certificate before its first
+    // token: an unauthenticated probe on the pinned agent opens the
+    // socket, its 401 gives the certificate, the binding goes on the
+    // target, and the handshake runs on that same keep-alive socket, as
+    // pywinrm's requests-kerberos does. A re-authentication starts from a
+    // cleared binding (resetContext), so a new socket's certificate is
+    // read again.
+    if (this.opts.tls && this.target.channelBindings === undefined && this.bindsFirstToken()) {
+      const probe = await this.requestOnce(Buffer.alloc(0), { 'Content-Type': SOAP_CONTENT_TYPE, 'Content-Length': '0' }, signal);
+      this.bindChannel(probe);
+      this.probeCertificate = probe.peerCertificate ?? null;
+    }
     // Prime the handshake. Multi-step mechanisms probe with an empty
     // body first; single-step ones (Basic) send the body at once.
     const first = await this.ctx.step();
@@ -438,11 +515,13 @@ export class WinRMTransport {
     this.checkEncryptionMechanism();
     let bodySent = first.complete;
     const firstBody = first.complete ? await body() : Buffer.alloc(0);
+    const expectCertificate = this.probeCertificate ?? undefined;
+    this.probeCertificate = null;
     let res = await this.requestOnce(firstBody, {
       Authorization: this.tokenHeader(first.output),
       'Content-Type': first.complete ? contentType : SOAP_CONTENT_TYPE,
       'Content-Length': String(firstBody.length),
-    }, signal);
+    }, signal, expectCertificate);
     let rounds = 0;
     const credssp = this.credssp();
     const maxRounds = credssp ? MAX_CREDSSP_HANDSHAKE_ROUNDS : MAX_HANDSHAKE_ROUNDS;
@@ -537,6 +616,7 @@ export class WinRMTransport {
     // A new socket may show a new certificate: the binding is set again
     // on its first challenge.
     delete this.target.channelBindings;
+    this.probeCertificate = null;
     this.ctx = this.newContext();
     this.authenticated = false;
     this.repeatHeader = null;

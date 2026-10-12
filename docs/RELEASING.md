@@ -27,15 +27,18 @@ Releases are not published from CI (see [The workflow files](#the-workflow-files
 ## Version policy
 
 - All five packages move in lockstep: one version, one tag, one release.
-- Internal runtime dependencies are **exact** (`"@winlinux/auth": "1.0.0"`,
+- Internal runtime dependencies are **exact** (`"@winlinux/auth": "1.1.0"`,
   not a caret range). The packages share one wire contract
   (`docs/contracts/`) and are tested only against each other at the same
-  version. A caret would let npm pair `winlinux@1.0.0` with a later
+  version. A caret would let npm pair `winlinux@1.1.0` with a later
   `@winlinux/winrm` that it was never tested with. The cost is that every
   release bumps all five, which the lockstep rule requires anyway.
 - `@winlinux/krb-session-key` is an `optionalDependencies` entry of
   `@winlinux/auth`, also exact. An install where the addon cannot load or
-  build still succeeds and falls back to the `kerberos` package.
+  build still succeeds and falls back to the `kerberos` package, which is
+  an optional dependency too: `winlinux` depends on it directly, so
+  the CLI always installs it, while `@winlinux/auth` alone can be installed
+  with `--omit=optional` for NTLM-only use.
 - `@winlinux/smb2` and `@winlinux/winrm` depend on `@winlinux/auth` only in
   `devDependencies` (their tests use the real providers). At run time they
   code against their own copies of the contract, so a user who installs one
@@ -103,14 +106,14 @@ publishes nothing.
 
 Use this only when Actions is unavailable. It publishes without provenance.
 
-### Release 1.0.0
+### Release 1.1.0
 
 From an up-to-date `main` checkout on the Mac:
 
 ```bash
 git checkout main && git pull
 npm run release:dry                   # 1. everything except the publish
-npm run release -- --publish 1.0.0    # 2. the real publish
+npm run release -- --publish 1.1.0    # 2. the real publish
 ```
 
 `npm run release:dry` runs every step and ends with `npm publish --dry-run`.
@@ -165,13 +168,13 @@ Mac: copy it into `prebuilds/darwin-x64/` first.
 ## Verify on the registry
 
 ```bash
-npm view winlinux@1.0.0 version                     # prints 1.0.0
-for p in @winlinux/krb-session-key @winlinux/auth @winlinux/smb2 @winlinux/winrm; do npm view "$p@1.0.0" version; done
-npm view @winlinux/krb-session-key@1.0.0 dist.fileCount dist.unpackedSize
+npm view winlinux@1.1.0 version                     # prints 1.1.0
+for p in @winlinux/krb-session-key @winlinux/auth @winlinux/smb2 @winlinux/winrm; do npm view "$p@1.1.0" version; done
+npm view @winlinux/krb-session-key@1.1.0 dist.fileCount dist.unpackedSize
 
 cd "$(mktemp -d)" && npm init -y >/dev/null
-npm install winlinux@1.0.0
-npx winlinux --version                              # prints 1.0.0
+npm install winlinux@1.1.0
+npx winlinux --version                              # prints 1.1.0
 node --input-type=module -e "import { connect } from 'winlinux'; console.log(typeof connect)"
 ```
 
@@ -185,8 +188,8 @@ After the registry shows all five packages:
 
 ```bash
 git checkout main && git pull
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 Only for a workstation release: the tag marks the commit that was
@@ -206,9 +209,9 @@ version's section of `CHANGELOG.md`.
 - **Deprecate** a bad version instead. Users then see a warning at install:
 
   ```bash
-  npm deprecate winlinux@1.0.0 "Broken: <reason>. Use 1.0.1."
+  npm deprecate winlinux@1.1.0 "Broken: <reason>. Use 1.1.1."
   for p in @winlinux/krb-session-key @winlinux/auth @winlinux/smb2 @winlinux/winrm; do
-    npm deprecate "$p@1.0.0" "Broken: <reason>. Use 1.0.1."
+    npm deprecate "$p@1.1.0" "Broken: <reason>. Use 1.1.1."
   done
   ```
 

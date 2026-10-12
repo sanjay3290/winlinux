@@ -130,6 +130,10 @@ load(); // optional: throws now if the addon or the GSS library is missing
 const client = await KrbClient.create('cifs@dc1.example.com', {
   ccache: 'FILE:/tmp/my-ccache', // optional; default: KRB5CCNAME / system default
   principal: 'alice@EXAMPLE.COM', // optional
+  // optional: RFC 2744 channel bindings (application_data, no addresses),
+  // for example "tls-server-end-point:" + hash(server certificate); every
+  // token of the context is bound to them, and client.channelBound is true
+  channelBindings: tlsServerEndPointBinding,
 });
 let token = await client.step(''); // base64 AP-REQ
 // ... send it, then feed the server's AP-REP back:
